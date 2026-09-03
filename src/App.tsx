@@ -13,6 +13,7 @@ import {
 type ProbeMode = 'static' | 'live'
 type ReferenceMode = 'static' | 'live'
 type SourceDimensions = { width: number; height: number }
+type PointLike = { x: number; y: number }
 type PipelineRow = FaceRecognitionPipelineUpdate
 type CropPreview = {
   title: string
@@ -976,6 +977,25 @@ function ImagePanel(props: {
   onEmptyClick: () => void
   onPreviewCrop?: (url: string) => void
 }) {
+  let mediaFrameRef: HTMLDivElement | undefined
+  const [viewportDimensions, setViewportDimensions] = createSignal<SourceDimensions>()
+
+  createEffect(() => {
+    if (!mediaFrameRef) return
+
+    const updateViewportDimensions = () => {
+      setViewportDimensions({
+        width: mediaFrameRef?.clientWidth ?? 0,
+        height: mediaFrameRef?.clientHeight ?? 0,
+      })
+    }
+    const observer = new ResizeObserver(updateViewportDimensions)
+
+    updateViewportDimensions()
+    observer.observe(mediaFrameRef)
+    onCleanup(() => observer.disconnect())
+  })
+
   return (
     <article class="flex flex-col gap-2 rounded-lg border border-slate-200 bg-white p-3 shadow-[0_1px_3px_rgba(15,23,42,0.04),0_1px_2px_rgba(15,23,42,0.04)]">
       <div class="flex items-center justify-between gap-3">
@@ -989,7 +1009,10 @@ function ImagePanel(props: {
         {props.modeLabel}
       </div>
 
-      <div class="relative flex aspect-video max-h-[42svh] w-full items-center justify-center overflow-hidden rounded-lg border border-slate-200 bg-slate-50">
+      <div
+        ref={mediaFrameRef}
+        class="relative flex aspect-video max-h-[42svh] w-full items-center justify-center overflow-hidden rounded-lg border border-slate-200 bg-slate-50"
+      >
         <Show when={props.imageUrl}>
           <img class="size-full object-cover" src={props.imageUrl} alt={`${props.title} source`} />
         </Show>
@@ -1011,7 +1034,12 @@ function ImagePanel(props: {
           </>
         </Show>
         <Show when={props.face && props.dimensions}>
-          <FaceOverlay face={props.face} dimensions={props.dimensions} mirrored={props.mirrored} />
+          <FaceOverlay
+            face={props.face}
+            dimensions={props.dimensions}
+            viewportDimensions={viewportDimensions()}
+            mirrored={props.mirrored}
+          />
         </Show>
         <Show when={!props.imageUrl && !props.showVideo}>
           <button
@@ -1069,23 +1097,68 @@ function ImagePanel(props: {
 function FaceOverlay(props: {
   face?: FaceDetectionSummary
   dimensions?: SourceDimensions
+  viewportDimensions?: SourceDimensions
   mirrored?: boolean
 }) {
+  const mapSourcePoint = (point: PointLike) => {
+    const source = props.dimensions
+    const viewport = props.viewportDimensions
+
+    if (!source || !viewport?.width || !viewport.height) {
+      return {
+        x: `${(props.mirrored ? 1 - point.x : point.x) * 100}%`,
+        y: `${point.y * 100}%`,
+      }
+    }
+
+    const scale = Math.max(viewport.width / source.width, viewport.height / source.height)
+    const renderedWidth = source.width * scale
+    const renderedHeight = source.height * scale
+    const offsetX = (viewport.width - renderedWidth) / 2
+    const offsetY = (viewport.height - renderedHeight) / 2
+    const sourceX = props.mirrored ? (1 - point.x) * source.width : point.x * source.width
+    const sourceY = point.y * source.height
+
+    return {
+      x: `${offsetX + sourceX * scale}px`,
+      y: `${offsetY + sourceY * scale}px`,
+    }
+  }
+
   const boxStyle = createMemo(() => {
     const face = props.face
     const dimensions = props.dimensions
+    const viewport = props.viewportDimensions
 
     if (!face || !dimensions) return {}
 
-    const left = props.mirrored
-      ? 100 - ((face.box.x + face.box.width) / dimensions.width) * 100
-      : (face.box.x / dimensions.width) * 100
+    if (!viewport?.width || !viewport.height) {
+      const left = props.mirrored
+        ? 100 - ((face.box.x + face.box.width) / dimensions.width) * 100
+        : (face.box.x / dimensions.width) * 100
+
+      return {
+        left: `${left}%`,
+        top: `${(face.box.y / dimensions.height) * 100}%`,
+        width: `${(face.box.width / dimensions.width) * 100}%`,
+        height: `${(face.box.height / dimensions.height) * 100}%`,
+      }
+    }
+
+    const scale = Math.max(viewport.width / dimensions.width, viewport.height / dimensions.height)
+    const renderedWidth = dimensions.width * scale
+    const renderedHeight = dimensions.height * scale
+    const offsetX = (viewport.width - renderedWidth) / 2
+    const offsetY = (viewport.height - renderedHeight) / 2
+    const sourceLeft = props.mirrored
+      ? dimensions.width - face.box.x - face.box.width
+      : face.box.x
 
     return {
-      left: `${left}%`,
-      top: `${(face.box.y / dimensions.height) * 100}%`,
-      width: `${(face.box.width / dimensions.width) * 100}%`,
-      height: `${(face.box.height / dimensions.height) * 100}%`,
+      left: `${offsetX + sourceLeft * scale}px`,
+      top: `${offsetY + face.box.y * scale}px`,
+      width: `${face.box.width * scale}px`,
+      height: `${face.box.height * scale}px`,
     }
   })
 
@@ -1101,8 +1174,8 @@ function FaceOverlay(props: {
           <span
             class="pointer-events-none absolute size-1.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-slate-950 shadow-[0_0_0_2px_rgba(255,255,255,0.85)]"
             style={{
-              left: `${props.mirrored ? (1 - keypoint.x) * 100 : keypoint.x * 100}%`,
-              top: `${keypoint.y * 100}%`,
+              left: mapSourcePoint(keypoint).x,
+              top: mapSourcePoint(keypoint).y,
             }}
             title={keypoint.label}
           />
