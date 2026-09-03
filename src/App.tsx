@@ -2,6 +2,8 @@ import { For, Show, createEffect, createMemo, createSignal, onCleanup, type JSX 
 import {
   FaceRecognition,
   type FaceDetectionSummary,
+  type FaceRecognitionDistanceMetric,
+  type FaceRecognitionModel,
   type FaceRecognitionPipelineUpdate,
   type FaceRecognitionResult,
   type FaceRecognitionRunHandle,
@@ -9,6 +11,7 @@ import {
 } from './utils/face-recognition'
 
 type ProbeMode = 'static' | 'live'
+type ReferenceMode = 'static' | 'live'
 type SourceDimensions = { width: number; height: number }
 type PipelineRow = FaceRecognitionPipelineUpdate
 type CropPreview = {
@@ -17,23 +20,27 @@ type CropPreview = {
   url: string
 }
 
-const STAGE_LABELS: Record<FaceRecognitionStage, string> = {
+const STAGE_LABELS: Record<Exclude<FaceRecognitionStage, 'embedding-running' | 'embedding-ready'>, string> = {
   'source-ready': 'Image Ingest',
   'face-detecting': 'Detection',
   'face-detected': 'Detection',
   'face-rejected': 'Detection',
   'face-cropping': 'Align & Crop',
   'face-cropped': 'Align & Crop',
-  'embedding-running': '512-d Vector',
-  'embedding-ready': '512-d Vector',
   comparing: 'Cosine Compare',
   completed: 'Cosine Compare',
   failed: 'Failed',
 }
 
+const MODEL_LABELS: Record<FaceRecognitionModel, string> = {
+  'arcface-mbf': 'ArcFace MBF',
+  sface: 'SFace',
+}
+
 export function App() {
   let referenceInputRef: HTMLInputElement | undefined
   let probeInputRef: HTMLInputElement | undefined
+  let referenceVideoRef: HTMLVideoElement | undefined
   let videoRef: HTMLVideoElement | undefined
   let recognizerPromise: Promise<FaceRecognition> | undefined
   let referenceObjectUrl: string | undefined
@@ -53,7 +60,11 @@ export function App() {
   const [probeFace, setProbeFace] = createSignal<FaceDetectionSummary>()
   const [referenceDimensions, setReferenceDimensions] = createSignal<SourceDimensions>()
   const [probeDimensions, setProbeDimensions] = createSignal<SourceDimensions>()
+  const [referenceMode, setReferenceMode] = createSignal<ReferenceMode>('static')
+  const [referenceSourceDetail, setReferenceSourceDetail] = createSignal('Reference enrollment source')
   const [probeMode, setProbeMode] = createSignal<ProbeMode>('static')
+  const [recognitionModel, setRecognitionModel] = createSignal<FaceRecognitionModel>('arcface-mbf')
+  const [distanceMetric, setDistanceMetric] = createSignal<FaceRecognitionDistanceMetric>('cosine')
   const [cameraStream, setCameraStream] = createSignal<MediaStream>()
   const [cameraError, setCameraError] = createSignal<string>()
   const [isStartingCamera, setIsStartingCamera] = createSignal(false)
@@ -67,21 +78,35 @@ export function App() {
     probeMode() === 'live' ? Boolean(cameraStream()) : Boolean(probeFile()),
   )
   const isReady = createMemo(() => Boolean(referenceFile()) && hasProbe() && !isVerifying())
+  const canRunContinuous = createMemo(
+    () => probeMode() === 'live' && Boolean(referenceFile()) && Boolean(cameraStream()) && !isVerifying(),
+  )
   const referenceRows = createMemo(() => pipelineRows().filter((row) => row.branch === 'reference'))
   const probeRows = createMemo(() => pipelineRows().filter((row) => row.branch === 'probe'))
   const referenceTotalMs = createMemo(() => totalDuration(referenceRows()))
   const probeTotalMs = createMemo(() => totalDuration(probeRows()))
   const score = createMemo(() => result()?.similarity.toFixed(3) ?? '0.000')
-  const scorePercent = createMemo(() => `${Math.round(Number(score()) * 1000) / 10}%`)
+  const scorePercent = createMemo(() => {
+    if (result()?.distanceMetric === 'norm_l2') {
+      return `${Math.max(0, Math.min(100, 100 - (Number(score()) / 1.5) * 100))}%`
+    }
 
-  const pipelineStatus = createMemo(() => {
-    if (cameraError()) return 'Camera unavailable'
-    if (isContinuousRunning()) return 'Continuous pipeline'
-    if (isVerifying()) return 'Pipeline running'
-    if (result()) return 'Verification complete'
-    if (isReady()) return 'Pipeline Active'
-    if (!referenceFile()) return hasProbe() ? 'Reference Required' : 'Awaiting Inputs'
-    return 'Probe Required'
+    return `${Math.round(Number(score()) * 1000) / 10}%`
+  })
+  const metricLabel = createMemo(() => {
+    if (result()?.distanceMetric === 'norm_l2') return 'L2 Distance'
+    return 'Cosine Score'
+  })
+  const vectorLabel = createMemo(() =>
+    recognitionModel() === 'sface' ? '128-d Vector' : '512-d Vector',
+  )
+  const compareLabel = createMemo(() =>
+    distanceMetric() === 'norm_l2' ? 'L2 Compare' : 'Cosine Compare',
+  )
+  const thresholdLabel = createMemo(() => {
+    if (recognitionModel() === 'sface' && distanceMetric() === 'norm_l2') return '1.128'
+    if (recognitionModel() === 'sface') return '0.363'
+    return '0.650'
   })
 
   const resultTitle = createMemo(() => {
@@ -100,7 +125,7 @@ export function App() {
     if (isContinuousRunning()) return 'Live probe frames are being checked continuously.'
     if (isVerifying()) return 'MediaPipe is detecting faces and preparing crops.'
     if (result()) {
-      return `Similarity score ${score()}. Recognition used the configured 512-d ONNX embedding model.`
+      return `${metricLabel()} ${score()}. Recognition used ${MODEL_LABELS[result()!.model]}.`
     }
     if (isReady()) {
       return probeMode() === 'live'
@@ -122,6 +147,10 @@ export function App() {
     if (videoRef) {
       videoRef.srcObject = stream ?? null
     }
+
+    if (referenceVideoRef) {
+      referenceVideoRef.srcObject = stream ?? null
+    }
   })
 
   function getRecognizer() {
@@ -129,6 +158,7 @@ export function App() {
       modelBaseUrl: `${import.meta.env.BASE_URL}models`,
       wasmBaseUrl: `${import.meta.env.BASE_URL}wasm`,
       embeddingModelUrl: 'https://static.tpsentinel.com/vendor/onnx/models/w600k_mbf.onnx',
+      sfaceModelUrl: 'https://static.tpsentinel.com/vendor/onnx/models/face_recognition_sface_2021dec_int8.onnx',
       onnxWasmBaseUrl: 'https://static.tpsentinel.com/vendor/onnx/runtime-web/',
     })
     return recognizerPromise
@@ -157,6 +187,57 @@ export function App() {
     })
 
     return URL.createObjectURL(blob)
+  }
+
+  async function waitForVideoFrame(video: HTMLVideoElement): Promise<void> {
+    if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth && video.videoHeight) {
+      return
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      const timeout = window.setTimeout(() => {
+        cleanup()
+        reject(new Error('Camera frame was not ready yet.'))
+      }, 3000)
+      const cleanup = () => {
+        window.clearTimeout(timeout)
+        video.removeEventListener('loadeddata', handleReady)
+        video.removeEventListener('canplay', handleReady)
+      }
+      const handleReady = () => {
+        cleanup()
+        resolve()
+      }
+
+      video.addEventListener('loadeddata', handleReady, { once: true })
+      video.addEventListener('canplay', handleReady, { once: true })
+    })
+  }
+
+  async function captureVideoFrame(video: HTMLVideoElement, filename: string): Promise<File> {
+    await waitForVideoFrame(video)
+
+    const canvas = document.createElement('canvas')
+    canvas.width = video.videoWidth
+    canvas.height = video.videoHeight
+    const context = canvas.getContext('2d')
+
+    if (!context) {
+      throw new Error('Could not create capture canvas.')
+    }
+
+    context.translate(canvas.width, 0)
+    context.scale(-1, 1)
+    context.drawImage(video, 0, 0, canvas.width, canvas.height)
+
+    const blob = await new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob((value) => {
+        if (value) resolve(value)
+        else reject(new Error('Could not capture webcam frame.'))
+      }, 'image/png')
+    })
+
+    return new File([blob], filename, { type: 'image/png' })
   }
 
   function resetRecognitionOutput() {
@@ -196,6 +277,8 @@ export function App() {
     referenceObjectUrl = URL.createObjectURL(file)
     setReferenceFile(file)
     setReferencePreview(referenceObjectUrl)
+    setReferenceMode('static')
+    setReferenceSourceDetail('Uploaded image source')
     void stopContinuousRun()
     resetRecognitionOutput()
   }
@@ -227,7 +310,58 @@ export function App() {
     setProbeMode('static')
     void stopContinuousRun()
     resetRecognitionOutput()
-    stopCamera()
+
+    if (referenceMode() !== 'live') {
+      stopCamera()
+    }
+  }
+
+  async function selectReferenceLiveMode() {
+    setReferenceMode('live')
+    void stopContinuousRun()
+    resetRecognitionOutput()
+
+    if (!cameraStream()) {
+      await startCamera()
+    }
+  }
+
+  function selectReferenceStaticMode() {
+    setReferenceMode('static')
+    void stopContinuousRun()
+    resetRecognitionOutput()
+
+    if (probeMode() !== 'live') {
+      stopCamera()
+    }
+  }
+
+  async function captureReferenceFromCamera() {
+    try {
+      setCameraError(undefined)
+
+      if (!cameraStream()) {
+        await startCamera()
+      }
+
+      const video = referenceVideoRef ?? videoRef
+      if (!video) {
+        throw new Error('Reference camera preview is not ready.')
+      }
+
+      const file = await captureVideoFrame(video, `reference-capture-${Date.now()}.png`)
+      revokeUrl(referenceObjectUrl)
+      referenceObjectUrl = URL.createObjectURL(file)
+      setReferenceFile(file)
+      setReferencePreview(referenceObjectUrl)
+      setReferenceMode('static')
+      setReferenceSourceDetail('Captured webcam frame')
+      void stopContinuousRun()
+      resetRecognitionOutput()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Could not capture reference image.'
+      setCameraError(message)
+    }
   }
 
   async function startCamera() {
@@ -266,8 +400,19 @@ export function App() {
     void startCamera()
   }
 
-  function resetWorkbench() {
-    setCameraError(undefined)
+  function selectRecognitionModel(model: FaceRecognitionModel) {
+    if (recognitionModel() === model) return
+
+    setRecognitionModel(model)
+    setDistanceMetric('cosine')
+    void stopContinuousRun()
+    resetRecognitionOutput()
+  }
+
+  function selectDistanceMetric(metric: FaceRecognitionDistanceMetric) {
+    if (distanceMetric() === metric) return
+
+    setDistanceMetric(metric)
     void stopContinuousRun()
     resetRecognitionOutput()
   }
@@ -338,7 +483,8 @@ export function App() {
       }
 
       const nextResult = await recognizer.checkOnce({
-        model: 'arcface-mbf',
+        model: recognitionModel(),
+        distanceMetric: distanceMetric(),
         reference: { type: 'image-file', file: reference },
         probe: probeSource,
         onUpdate: handlePipelineUpdate,
@@ -364,7 +510,8 @@ export function App() {
     setCameraError(undefined)
     const recognizer = await getRecognizer()
     continuousRun = await recognizer.startContinuous({
-      model: 'arcface-mbf',
+      model: recognitionModel(),
+      distanceMetric: distanceMetric(),
       reference: { type: 'image-file', file: reference },
       probe: { type: 'video', video },
       intervalMs: 1000,
@@ -388,73 +535,64 @@ export function App() {
 
   return (
     <div class="min-h-svh bg-[#F8FAFC] text-slate-900 antialiased">
-      <header class="sticky top-0 z-40 border-b border-slate-200/90 bg-white/95 shadow-[0_1px_2px_rgba(15,23,42,0.04)] backdrop-blur">
-        <div class="mx-auto flex h-14 max-w-[1440px] items-center justify-between gap-4 px-4 sm:px-6">
-          <div class="flex min-w-0 items-center gap-2.5">
-            <div class="flex size-7 shrink-0 items-center justify-center rounded-md bg-slate-900 text-white shadow-sm">
-              <span class="material-symbols-outlined text-[17px]">fingerprint</span>
-            </div>
-            <div class="min-w-0">
-              <p class="truncate text-xs font-semibold text-slate-900">Face Recognition POC</p>
-              <p class="hidden text-[11px] font-medium text-slate-500 sm:block">
-                Reference enrollment and probe evaluation
-              </p>
-            </div>
-            <span class="ml-1 rounded-md border border-slate-200 bg-slate-100 px-2 py-0.5 font-mono text-[11px] font-medium text-slate-600">
-              v0.1.0
-            </span>
-          </div>
-
-          <div class="hidden items-center gap-3 md:flex">
-            <div class="inline-flex rounded-lg border border-slate-200 bg-slate-100 p-0.5 text-xs font-medium">
-              <button
-                class="rounded-md border border-slate-200/60 bg-white px-3 py-1 font-semibold text-slate-900 shadow-sm"
-                type="button"
-              >
-                ArcFace MBF
-              </button>
-              <button class="rounded-md px-3 py-1 text-slate-600 transition-colors hover:text-slate-900" type="button">
-                SFace v2
-              </button>
-            </div>
-            <span class="inline-flex items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 py-1 font-mono text-xs text-slate-600 shadow-sm">
-              <span class="size-1.5 rounded-full bg-emerald-500"></span>
-              WASM SIMD
-            </span>
-          </div>
-
-          <div class="flex items-center gap-2 sm:gap-3">
-            <div class="inline-flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-xs font-medium text-emerald-700">
-              <span class="size-1.5 rounded-full bg-emerald-500"></span>
-              <span>{pipelineStatus()}</span>
-            </div>
-            <div class="hidden h-4 w-px bg-slate-200 sm:block"></div>
-            <button
-              class="rounded-md border border-transparent p-1.5 text-slate-500 transition-colors hover:border-slate-200 hover:bg-slate-100 hover:text-slate-900"
-              title="Reset evaluation"
-              type="button"
-              onClick={resetWorkbench}
-            >
-              <span class="material-symbols-outlined text-[19px]">refresh</span>
-            </button>
-          </div>
-        </div>
-      </header>
-
-      <main class="mx-auto flex w-full max-w-[1440px] flex-col gap-6 px-4 py-6 sm:px-6">
-        <section class="grid grid-cols-1 gap-6 lg:grid-cols-2" aria-label="Face comparison inputs">
+      <main class="mx-auto flex w-full max-w-[1440px] flex-col gap-3 px-3 py-3 sm:px-4">
+        <section class="grid grid-cols-1 gap-3 lg:grid-cols-2" aria-label="Face comparison inputs">
           <ImagePanel
             branch="reference"
             title="Reference Face"
             subtitle="(Enrolled Model)"
-            modeLabel="Static Image"
-            imageUrl={referencePreview()}
+            modeLabel={
+              <div class="inline-flex rounded-md border border-slate-200 bg-slate-100 p-0.5 text-xs font-medium">
+                <button
+                  class="rounded px-2.5 py-1 text-slate-600 transition-colors hover:text-slate-900"
+                  classList={{
+                    'border border-slate-200/70 bg-white font-medium text-slate-900 shadow-sm':
+                      referenceMode() === 'static',
+                  }}
+                  type="button"
+                  onClick={selectReferenceStaticMode}
+                >
+                  Upload
+                </button>
+                <button
+                  class="rounded px-2.5 py-1 text-slate-600 transition-colors hover:text-slate-900"
+                  classList={{
+                    'border border-slate-200/70 bg-white font-medium text-slate-900 shadow-sm':
+                      referenceMode() === 'live',
+                  }}
+                  type="button"
+                  onClick={() => void selectReferenceLiveMode()}
+                >
+                  Camera
+                </button>
+              </div>
+            }
+            imageUrl={referenceMode() === 'static' ? referencePreview() : undefined}
+            videoRef={(element) => {
+              referenceVideoRef = element
+              element.srcObject = cameraStream() ?? null
+            }}
+            showVideo={referenceMode() === 'live' && Boolean(cameraStream())}
             croppedUrl={referenceCropPreview()}
             face={referenceFace()}
             dimensions={referenceDimensions()}
-            onEmptyClick={() => referenceInputRef?.click()}
+            mirrored={referenceMode() === 'live'}
+            onEmptyClick={() => {
+              if (referenceMode() === 'live') {
+                void startCamera()
+                return
+              }
+
+              referenceInputRef?.click()
+            }}
+            emptyTitle={referenceMode() === 'live' ? 'Camera Capture Required' : 'No Reference Enrolled'}
+            emptyDetail={
+              referenceMode() === 'live'
+                ? 'Start the camera and capture a reference frame.'
+                : 'Upload or capture a biometric image to create the reference enrollment.'
+            }
             metadataTitle={referenceCropPreview() ? 'Cropped reference ready' : 'Reference image required'}
-            metadataDetail="Reference enrollment source"
+            metadataDetail={referenceSourceDetail()}
             onPreviewCrop={(url) =>
               setCropPreview({
                 title: 'Cropped Reference',
@@ -463,21 +601,47 @@ export function App() {
               })
             }
             action={
-              <label
-                class="flex shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 shadow-sm transition-colors hover:bg-slate-50 hover:text-slate-900"
-                for="reference-input"
+              <Show
+                when={referenceMode() === 'live'}
+                fallback={
+                  <label
+                    class="flex shrink-0 cursor-pointer items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-medium text-slate-700 shadow-sm transition-colors hover:bg-slate-50 hover:text-slate-900"
+                    for="reference-input"
+                  >
+                    <span class="material-symbols-outlined text-[15px]">file_upload</span>
+                    <span>{referencePreview() ? 'Replace' : 'Upload'}</span>
+                    <input
+                      ref={referenceInputRef}
+                      id="reference-input"
+                      class="sr-only"
+                      type="file"
+                      accept="image/*"
+                      onChange={handleReferenceUpload}
+                    />
+                  </label>
+                }
               >
-                <span class="material-symbols-outlined text-[15px]">file_upload</span>
-                <span>{referencePreview() ? 'Replace' : 'Upload'}</span>
-                <input
-                  ref={referenceInputRef}
-                  id="reference-input"
-                  class="sr-only"
-                  type="file"
-                  accept="image/*"
-                  onChange={handleReferenceUpload}
-                />
-              </label>
+                <button
+                  class="flex shrink-0 items-center gap-1.5 rounded-md bg-slate-900 px-3 py-1.5 text-[11px] font-medium text-white shadow-sm transition-all hover:bg-slate-800 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-60"
+                  type="button"
+                  disabled={isStartingCamera()}
+                  onClick={() => {
+                    if (cameraStream()) {
+                      void captureReferenceFromCamera()
+                      return
+                    }
+
+                    void startCamera()
+                  }}
+                >
+                  <span class="material-symbols-outlined text-[16px]">
+                    {cameraStream() ? 'photo_camera' : 'videocam'}
+                  </span>
+                  <span>
+                    {isStartingCamera() ? 'Starting' : cameraStream() ? 'Capture' : 'Start Camera'}
+                  </span>
+                </button>
+              </Show>
             }
           />
 
@@ -514,6 +678,7 @@ export function App() {
             imageUrl={probeMode() === 'static' ? probePreview() : undefined}
             videoRef={(element) => {
               videoRef = element
+              element.srcObject = cameraStream() ?? null
             }}
             showVideo={probeMode() === 'live' && Boolean(cameraStream())}
             croppedUrl={probeCropPreview()}
@@ -548,7 +713,7 @@ export function App() {
                 when={probeMode() === 'live'}
                 fallback={
                   <label
-                    class="flex shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 shadow-sm transition-colors hover:bg-slate-50 hover:text-slate-900"
+                    class="flex shrink-0 cursor-pointer items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-medium text-slate-700 shadow-sm transition-colors hover:bg-slate-50 hover:text-slate-900"
                     for="probe-input"
                   >
                     <span class="material-symbols-outlined text-[15px]">file_upload</span>
@@ -565,7 +730,7 @@ export function App() {
                 }
               >
                 <button
-                  class="flex shrink-0 items-center gap-1.5 rounded-lg bg-slate-900 px-4 py-2 text-xs font-medium text-white shadow-sm transition-all hover:bg-slate-800 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-60"
+                  class="flex shrink-0 items-center gap-1.5 rounded-md bg-slate-900 px-3 py-1.5 text-[11px] font-medium text-white shadow-sm transition-all hover:bg-slate-800 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-60"
                   type="button"
                   disabled={isStartingCamera()}
                   onClick={toggleCamera}
@@ -591,17 +756,15 @@ export function App() {
           probeRows={probeRows()}
           referenceTotalMs={referenceTotalMs()}
           probeTotalMs={probeTotalMs()}
-          canRunContinuous={probeMode() === 'live' && Boolean(referenceFile()) && Boolean(cameraStream())}
-          isContinuousRunning={isContinuousRunning()}
-          onStartContinuous={() => void startContinuousPipeline()}
-          onStopContinuous={() => void stopContinuousRun()}
+          vectorLabel={vectorLabel()}
+          compareLabel={compareLabel()}
         />
 
-        <section class="rounded-xl border border-slate-200 bg-white p-5 shadow-[0_1px_3px_rgba(15,23,42,0.04),0_1px_2px_rgba(15,23,42,0.04)] sm:p-6">
-          <div class="flex flex-col items-start justify-between gap-6 border-b border-slate-100 pb-5 lg:flex-row lg:items-center">
-            <div class="flex flex-col gap-4 sm:flex-row sm:items-center">
+        <section class="rounded-lg border border-slate-200 bg-white p-3 shadow-[0_1px_3px_rgba(15,23,42,0.04),0_1px_2px_rgba(15,23,42,0.04)]">
+          <div class="flex flex-col items-start justify-between gap-3 lg:flex-row lg:items-center">
+            <div class="flex flex-col gap-2 sm:flex-row sm:items-center">
               <div
-                class="inline-flex items-center gap-2 rounded-lg border px-3.5 py-2 text-sm font-semibold shadow-sm"
+                class="inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs font-semibold shadow-sm"
                 classList={{
                   'border-emerald-200 bg-emerald-50 text-emerald-800': isReady() || Boolean(result()),
                   'border-amber-200 bg-amber-50 text-amber-800': !isReady() && !result() && !cameraError(),
@@ -614,68 +777,136 @@ export function App() {
                 <span>{resultTitle()}</span>
               </div>
               <div>
-                <p class="text-sm font-semibold text-slate-900">{resultDetail()}</p>
-                <p class="mt-0.5 text-xs text-slate-500">
-                  Operating threshold: 0.650. Embeddings are compared with cosine similarity.
+                <p class="text-xs font-semibold text-slate-900">{resultDetail()}</p>
+                <p class="mt-0.5 text-[11px] text-slate-500">
+                  Operating threshold: {thresholdLabel()}. Embeddings are compared with {distanceMetric() === 'norm_l2' ? 'normalized L2 distance' : 'cosine similarity'}.
                 </p>
               </div>
             </div>
 
-            <div class="flex items-center gap-4 self-stretch rounded-lg border border-slate-200/80 bg-slate-50/80 px-4 py-2.5 sm:self-auto">
+            <div class="flex items-center gap-3 self-stretch rounded-lg border border-slate-200/80 bg-slate-50/80 px-3 py-1.5 sm:self-auto">
               <div class="flex flex-col">
                 <span class="font-mono text-[10px] font-semibold uppercase tracking-wider text-slate-500">
-                  Similarity Metric
+                  {metricLabel()}
                 </span>
                 <div class="flex items-baseline gap-1">
-                  <span class="font-mono text-3xl font-bold tracking-tight text-slate-900">{score()}</span>
-                  <span class="font-mono text-xs text-slate-400">/ 1.000</span>
+                  <span class="font-mono text-2xl font-bold tracking-tight text-slate-900">{score()}</span>
+                  <span class="font-mono text-xs text-slate-400">
+                    {result()?.distanceMetric === 'norm_l2' ? 'distance' : '/ 1.000'}
+                  </span>
                 </div>
               </div>
-              <div class="flex flex-col items-end justify-center border-l border-slate-200 pl-4">
+              <div class="flex flex-col items-end justify-center border-l border-slate-200 pl-3">
                 <span class="text-xs font-semibold text-emerald-700">{scorePercent()}</span>
                 <span class="font-mono text-[10px] text-slate-400">score</span>
               </div>
             </div>
           </div>
 
-          <div class="flex flex-col gap-3 pt-5">
-            <div class="flex items-center justify-between text-xs text-slate-500">
-              <span class="font-medium text-slate-700">Classification Spectrum</span>
-              <div class="hidden items-center gap-4 text-[11px] sm:flex">
-                <span class="inline-flex items-center gap-1.5"><span class="size-2 rounded-full bg-rose-500"></span>Mismatch</span>
-                <span class="inline-flex items-center gap-1.5"><span class="size-2 rounded-full bg-amber-500"></span>Review Zone</span>
-                <span class="inline-flex items-center gap-1.5"><span class="size-2 rounded-full bg-emerald-600"></span>Match</span>
-              </div>
-            </div>
+          <div class="pt-3">
+            <div class="flex flex-col justify-between gap-2 rounded-lg border border-slate-200/70 bg-slate-50 px-3 py-2 text-xs xl:flex-row xl:items-center">
+              <div class="flex flex-wrap items-center gap-3 text-slate-600">
+                <div class="flex items-center gap-2">
+                  <span class="font-medium">Model:</span>
+                  <div class="inline-flex rounded-lg border border-slate-200 bg-slate-100 p-0.5 text-xs font-medium">
+                    <button
+                      class="rounded-md px-2.5 py-1 text-slate-600 transition-colors hover:text-slate-900"
+                      classList={{
+                        'border border-slate-200/60 bg-white font-semibold text-slate-900 shadow-sm':
+                          recognitionModel() === 'arcface-mbf',
+                      }}
+                      type="button"
+                      onClick={() => selectRecognitionModel('arcface-mbf')}
+                    >
+                      ArcFace MBF
+                    </button>
+                    <button
+                      class="rounded-md px-2.5 py-1 text-slate-600 transition-colors hover:text-slate-900"
+                      classList={{
+                        'border border-slate-200/60 bg-white font-semibold text-slate-900 shadow-sm':
+                          recognitionModel() === 'sface',
+                      }}
+                      type="button"
+                      onClick={() => selectRecognitionModel('sface')}
+                    >
+                      SFace
+                    </button>
+                  </div>
+                </div>
 
-            <div class="relative flex h-2.5 w-full overflow-hidden rounded-full border border-slate-200 bg-slate-100">
-              <div class="h-full w-[55%] border-r border-rose-200 bg-rose-100"></div>
-              <div class="h-full w-[10%] border-r border-amber-200 bg-amber-100"></div>
-              <div class="h-full w-[35%] bg-emerald-100"></div>
-              <div
-                class="absolute bottom-0 top-0 w-1 -translate-x-1/2 bg-slate-900 shadow-sm transition-all duration-300"
-                style={{ left: result() ? scorePercent() : '0%' }}
+                <Show when={recognitionModel() === 'sface'}>
+                  <div class="flex items-center gap-2">
+                    <span class="font-medium">Metric:</span>
+                    <div class="inline-flex rounded-lg border border-slate-200 bg-slate-100 p-0.5 text-xs font-medium">
+                      <button
+                        class="rounded-md px-2.5 py-1 text-slate-600 transition-colors hover:text-slate-900"
+                        classList={{
+                          'border border-slate-200/60 bg-white font-semibold text-slate-900 shadow-sm':
+                            distanceMetric() === 'cosine',
+                        }}
+                        type="button"
+                        onClick={() => selectDistanceMetric('cosine')}
+                      >
+                        Cosine
+                      </button>
+                      <button
+                        class="rounded-md px-2.5 py-1 text-slate-600 transition-colors hover:text-slate-900"
+                        classList={{
+                          'border border-slate-200/60 bg-white font-semibold text-slate-900 shadow-sm':
+                            distanceMetric() === 'norm_l2',
+                        }}
+                        type="button"
+                        onClick={() => selectDistanceMetric('norm_l2')}
+                      >
+                        L2
+                      </button>
+                    </div>
+                  </div>
+                </Show>
+
+                <div class="flex items-center gap-2">
+                  <span class="font-medium">Threshold:</span>
+                  <span class="rounded border border-slate-200 bg-white px-2 py-0.5 font-mono font-semibold text-slate-800 shadow-sm">
+                    {thresholdLabel()}
+                  </span>
+                </div>
+              </div>
+              <Show
+                when={probeMode() === 'live'}
+                fallback={
+                  <button
+                    class="flex items-center justify-center gap-2 rounded-lg bg-slate-900 px-4 py-2 text-xs font-medium text-white shadow-sm transition-all hover:bg-slate-800 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-60"
+                    type="button"
+                    disabled={!isReady()}
+                    onClick={() => void verifyCandidate()}
+                  >
+                    <span class="material-symbols-outlined text-[16px]">verified</span>
+                    <span>{isVerifying() ? 'Verifying' : 'Verify Candidate'}</span>
+                  </button>
+                }
               >
-                <div class="absolute -left-[2px] -top-0.5 size-2 rounded-full bg-slate-900"></div>
-              </div>
-            </div>
-
-            <div class="mt-1 flex flex-col justify-between gap-3 rounded-lg border border-slate-200/70 bg-slate-50 px-3.5 py-2 text-xs sm:flex-row sm:items-center">
-              <div class="flex items-center gap-2 text-slate-600">
-                <span class="font-medium">Verification Threshold:</span>
-                <span class="rounded border border-slate-200 bg-white px-2 py-0.5 font-mono font-semibold text-slate-800 shadow-sm">
-                  0.650
-                </span>
-              </div>
-              <Show when={probeMode() === 'static'}>
                 <button
-                  class="flex items-center justify-center gap-2 rounded-lg bg-slate-900 px-4 py-2 text-xs font-medium text-white shadow-sm transition-all hover:bg-slate-800 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-60"
+                  class="flex items-center justify-center gap-2 rounded-lg px-4 py-2 text-xs font-medium shadow-sm transition-all active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-60"
+                  classList={{
+                    'bg-rose-50 text-rose-700 ring-1 ring-inset ring-rose-200 hover:bg-rose-100':
+                      isContinuousRunning(),
+                    'bg-slate-900 text-white hover:bg-slate-800': !isContinuousRunning(),
+                  }}
                   type="button"
-                  disabled={!isReady()}
-                  onClick={() => void verifyCandidate()}
+                  disabled={!canRunContinuous() && !isContinuousRunning()}
+                  onClick={() => {
+                    if (isContinuousRunning()) {
+                      void stopContinuousRun()
+                      return
+                    }
+
+                    void startContinuousPipeline()
+                  }}
                 >
-                  <span class="material-symbols-outlined text-[16px]">verified</span>
-                  <span>{isVerifying() ? 'Verifying' : 'Verify Candidate'}</span>
+                  <span class="material-symbols-outlined text-[16px]">
+                    {isContinuousRunning() ? 'stop_circle' : 'play_circle'}
+                  </span>
+                  <span>{isContinuousRunning() ? 'Stop Continuous' : 'Run Continuous'}</span>
                 </button>
               </Show>
             </div>
@@ -746,19 +977,19 @@ function ImagePanel(props: {
   onPreviewCrop?: (url: string) => void
 }) {
   return (
-    <article class="flex flex-col gap-4 rounded-xl border border-slate-200 bg-white p-5 shadow-[0_1px_3px_rgba(15,23,42,0.04),0_1px_2px_rgba(15,23,42,0.04)]">
-      <div class="flex items-center justify-between gap-3 border-b border-slate-100 pb-1">
+    <article class="flex flex-col gap-2 rounded-lg border border-slate-200 bg-white p-3 shadow-[0_1px_3px_rgba(15,23,42,0.04),0_1px_2px_rgba(15,23,42,0.04)]">
+      <div class="flex items-center justify-between gap-3">
         <div class="flex min-w-0 items-center gap-2">
           <span class="flex size-5 shrink-0 items-center justify-center rounded border border-slate-200 bg-slate-100 font-mono text-xs font-semibold text-slate-700">
             {props.branch === 'reference' ? '1' : '2'}
           </span>
-          <h2 class="text-sm font-semibold tracking-tight text-slate-900">{props.title}</h2>
+          <h2 class="text-xs font-semibold tracking-tight text-slate-900 sm:text-sm">{props.title}</h2>
           <span class="hidden text-xs font-normal text-slate-500 sm:inline">{props.subtitle}</span>
         </div>
         {props.modeLabel}
       </div>
 
-      <div class="relative flex aspect-[4/3] w-full items-center justify-center overflow-hidden rounded-lg border border-slate-200 bg-slate-50">
+      <div class="relative flex aspect-video max-h-[42svh] w-full items-center justify-center overflow-hidden rounded-lg border border-slate-200 bg-slate-50">
         <Show when={props.imageUrl}>
           <img class="size-full object-cover" src={props.imageUrl} alt={`${props.title} source`} />
         </Show>
@@ -803,10 +1034,10 @@ function ImagePanel(props: {
         </Show>
       </div>
 
-      <div class="flex items-center justify-between gap-4 rounded-lg border border-slate-200 bg-slate-50 p-3">
-        <div class="flex min-w-0 items-center gap-3">
+      <div class="flex items-center justify-between gap-3 rounded-lg border border-slate-200 bg-slate-50 p-2">
+        <div class="flex min-w-0 items-center gap-2">
           <button
-            class="group relative flex size-11 shrink-0 items-center justify-center overflow-hidden rounded border border-slate-300 bg-white shadow-sm transition-colors disabled:cursor-default"
+            class="group relative flex size-9 shrink-0 items-center justify-center overflow-hidden rounded border border-slate-300 bg-white shadow-sm transition-colors disabled:cursor-default"
             type="button"
             disabled={!props.croppedUrl}
             title={props.croppedUrl ? 'Preview crop' : undefined}
@@ -825,8 +1056,8 @@ function ImagePanel(props: {
             </Show>
           </button>
           <div class="min-w-0">
-            <p class="truncate text-xs font-semibold text-slate-800">{props.metadataTitle}</p>
-            <p class="mt-0.5 truncate font-mono text-xs text-slate-500">{props.metadataDetail}</p>
+            <p class="truncate text-[11px] font-semibold text-slate-800">{props.metadataTitle}</p>
+            <p class="mt-0.5 truncate font-mono text-[10px] text-slate-500">{props.metadataDetail}</p>
           </div>
         </div>
         {props.action}
@@ -892,64 +1123,41 @@ function PipelineTimeline(props: {
   probeRows: PipelineRow[]
   referenceTotalMs: number
   probeTotalMs: number
-  canRunContinuous: boolean
-  isContinuousRunning: boolean
-  onStartContinuous: () => void
-  onStopContinuous: () => void
+  vectorLabel: string
+  compareLabel: string
 }) {
   return (
-    <section class="rounded-xl border border-slate-200 bg-white p-4 shadow-[0_1px_3px_rgba(15,23,42,0.04),0_1px_2px_rgba(15,23,42,0.04)] sm:p-5">
-      <div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-2">
+    <section class="rounded-lg border border-slate-200 bg-white p-3 shadow-[0_1px_3px_rgba(15,23,42,0.04),0_1px_2px_rgba(15,23,42,0.04)]">
+      <div class="flex flex-wrap items-center justify-between gap-2">
         <div class="flex items-center gap-2">
           <span class="material-symbols-outlined text-[18px] text-slate-500">alt_route</span>
           <h3 class="text-xs font-semibold tracking-tight text-slate-900 sm:text-sm">
             Execution Trace & Inference Pipelines
           </h3>
-          <span class="hidden text-[11px] text-slate-400 sm:inline">
+          <span class="hidden text-[10px] text-slate-400 sm:inline">
             Per-frame SIMD worker latency
           </span>
         </div>
-        <div class="flex items-center gap-2">
-          <button
-            class="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs font-medium shadow-sm transition-colors disabled:cursor-not-allowed disabled:opacity-50"
-            classList={{
-              'border-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100': props.isContinuousRunning,
-              'border-slate-200 bg-white text-slate-700 hover:bg-slate-50': !props.isContinuousRunning,
-            }}
-            type="button"
-            disabled={!props.canRunContinuous && !props.isContinuousRunning}
-            onClick={() => {
-              if (props.isContinuousRunning) {
-                props.onStopContinuous()
-                return
-              }
-
-              props.onStartContinuous()
-            }}
-          >
-            <span class="material-symbols-outlined text-[15px]">
-              {props.isContinuousRunning ? 'stop_circle' : 'play_circle'}
-            </span>
-            <span>{props.isContinuousRunning ? 'Stop Continuous' : 'Run Continuous'}</span>
-          </button>
-          <span class="rounded border border-slate-200 bg-slate-50 px-2 py-0.5 font-mono text-[11px] text-slate-500">
-            WASM SIMD Parallel
-          </span>
-        </div>
+        <span class="rounded border border-slate-200 bg-slate-50 px-2 py-0.5 font-mono text-[10px] text-slate-500">
+          WASM SIMD Parallel
+        </span>
       </div>
 
-      <div class="flex flex-col gap-3 pt-3">
+      <div class="flex flex-col gap-2 pt-2">
         <PipelineBranch
           label="Reference Stream"
           rows={props.referenceRows}
           totalMs={props.referenceTotalMs}
-          emptyStages={['Image Ingest', 'Detection', 'Align & Crop', '512-d Vector']}
+          emptyStages={['Image Ingest', 'Detection', 'Align & Crop', props.vectorLabel]}
+          vectorLabel={props.vectorLabel}
         />
         <PipelineBranch
           label="Live Candidate Stream"
           rows={props.probeRows}
           totalMs={props.probeTotalMs}
-          emptyStages={['Frame Ingest', 'Detection', 'Align & Crop', '512-d Vector', 'Cosine Compare']}
+          emptyStages={['Frame Ingest', 'Detection', 'Align & Crop', props.vectorLabel, props.compareLabel]}
+          vectorLabel={props.vectorLabel}
+          compareLabel={props.compareLabel}
         />
       </div>
     </section>
@@ -961,11 +1169,20 @@ function PipelineBranch(props: {
   rows: PipelineRow[]
   totalMs: number
   emptyStages: string[]
+  vectorLabel?: string
+  compareLabel?: string
 }) {
-  const tiles = createMemo(() => compactPipelineRows(props.rows, props.emptyStages))
+  const tiles = createMemo(() =>
+    compactPipelineRows(
+      props.rows,
+      props.emptyStages,
+      props.vectorLabel ?? '512-d Vector',
+      props.compareLabel ?? 'Cosine Compare',
+    ),
+  )
 
   return (
-    <div class="flex flex-col gap-1.5">
+    <div class="flex flex-col gap-1">
       <div class="flex items-center justify-between text-[11px] font-medium text-slate-500">
         <span class="flex items-center gap-1.5">
           <span class="size-1.5 rounded-full bg-slate-400"></span>
@@ -975,11 +1192,11 @@ function PipelineBranch(props: {
           Cumulative: {props.totalMs.toFixed(1)} ms
         </span>
       </div>
-      <div class="grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-5">
+      <div class="grid grid-cols-1 gap-1.5 md:grid-cols-2 xl:grid-cols-5">
         <For each={tiles()}>
           {(tile) => (
             <div
-              class="flex items-center justify-between gap-2 rounded-lg border bg-slate-50 px-2.5 py-2"
+              class="flex items-center justify-between gap-2 rounded-md border bg-slate-50 px-2 py-1.5"
               classList={{
                 'border-slate-200': tile.status === 'idle',
                 'border-emerald-200': tile.status === 'success',
@@ -1005,9 +1222,9 @@ function PipelineBranch(props: {
                         ? 'radio_button_unchecked'
                         : 'check_circle'}
                 </span>
-                <span class="truncate text-xs font-medium text-slate-700">{tile.label}</span>
+                <span class="truncate text-[11px] font-medium text-slate-700">{tile.label}</span>
               </div>
-              <span class="shrink-0 font-mono text-[11px] text-slate-500">
+              <span class="shrink-0 font-mono text-[10px] text-slate-500">
                 {tile.durationMs === undefined ? '--' : `${tile.durationMs.toFixed(1)} ms`}
               </span>
             </div>
@@ -1018,7 +1235,12 @@ function PipelineBranch(props: {
   )
 }
 
-function compactPipelineRows(rows: PipelineRow[], emptyStages: string[]) {
+function compactPipelineRows(
+  rows: PipelineRow[],
+  emptyStages: string[],
+  vectorLabel: string,
+  compareLabel: string,
+) {
   if (!rows.length) {
     return emptyStages.map((label) => ({
       label,
@@ -1034,7 +1256,14 @@ function compactPipelineRows(rows: PipelineRow[], emptyStages: string[]) {
   }))
 
   for (const row of rows) {
-    const label = row.stage === 'source-ready' && row.branch === 'probe' ? 'Frame Ingest' : STAGE_LABELS[row.stage]
+    const label =
+      row.stage === 'embedding-running' || row.stage === 'embedding-ready'
+        ? vectorLabel
+        : row.stage === 'comparing' || row.stage === 'completed'
+          ? compareLabel
+        : row.stage === 'source-ready' && row.branch === 'probe'
+          ? 'Frame Ingest'
+          : STAGE_LABELS[row.stage]
     const target = labels.find((tile) => tile.label === label)
 
     if (!target) continue

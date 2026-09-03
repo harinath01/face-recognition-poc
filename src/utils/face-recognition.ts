@@ -1,8 +1,14 @@
 import type { FaceLandmarkerResult } from '@mediapipe/tasks-vision'
 import { FaceDetector } from './face-detector'
-import { cosineSimilarity, FaceEmbedder } from './face-embedder'
+import {
+  cosineSimilarity,
+  FaceEmbedder,
+  normL2Distance,
+  type FaceEmbeddingModel,
+} from './face-embedder'
 
-export type FaceRecognitionModel = 'arcface-mbf' | 'sface'
+export type FaceRecognitionModel = FaceEmbeddingModel
+export type FaceRecognitionDistanceMetric = 'cosine' | 'norm_l2'
 
 export type FaceRecognitionRunMode = 'single' | 'continuous'
 
@@ -63,6 +69,7 @@ export type FaceRecognitionPipelineUpdate = {
 export type FaceRecognitionResult = {
   runId: string
   model: FaceRecognitionModel
+  distanceMetric: FaceRecognitionDistanceMetric
   similarity: number
   decision: FaceRecognitionDecision
   reference: {
@@ -105,6 +112,7 @@ export type FaceRecognitionOptions = {
   modelBaseUrl?: string
   wasmBaseUrl?: string
   embeddingModelUrl?: string
+  sfaceModelUrl?: string
   onnxWasmBaseUrl?: string
 }
 
@@ -116,6 +124,7 @@ export type FaceRecognitionSingleCheckOptions = {
     match: number
     mismatch: number
   }
+  distanceMetric?: FaceRecognitionDistanceMetric
   onUpdate?: (update: FaceRecognitionPipelineUpdate) => void
   signal?: AbortSignal
 }
@@ -131,6 +140,7 @@ export type FaceRecognitionContinuousOptions = {
     match: number
     mismatch: number
   }
+  distanceMetric?: FaceRecognitionDistanceMetric
   onUpdate?: (update: FaceRecognitionPipelineUpdate) => void
   onResult?: (result: FaceRecognitionResult) => void
   onError?: (error: FaceRecognitionError) => void
@@ -188,6 +198,14 @@ const DEFAULT_THRESHOLD = {
   match: 0.65,
   mismatch: 0.55,
 }
+const DEFAULT_SFACE_COSINE_THRESHOLD = {
+  match: 0.363,
+  mismatch: 0.363,
+}
+const DEFAULT_SFACE_NORM_L2_THRESHOLD = {
+  match: 1.128,
+  mismatch: 1.128,
+}
 
 export class FaceRecognition {
   private readonly detector: FaceDetector
@@ -201,7 +219,10 @@ export class FaceRecognition {
   static async create(options: FaceRecognitionOptions = {}): Promise<FaceRecognition> {
     const detector = new FaceDetector()
     const embedder = new FaceEmbedder({
-      modelUrl: options.embeddingModelUrl,
+      modelUrls: {
+        'arcface-mbf': options.embeddingModelUrl,
+        sface: options.sfaceModelUrl,
+      },
       wasmBaseUrl: options.onnxWasmBaseUrl,
     })
 
@@ -224,7 +245,8 @@ export class FaceRecognition {
 
   async checkOnce(options: FaceRecognitionSingleCheckOptions): Promise<FaceRecognitionResult> {
     const runId = createRunId()
-    const threshold = options.threshold ?? DEFAULT_THRESHOLD
+    const distanceMetric = getDistanceMetric(options.model, options.distanceMetric)
+    const threshold = getThreshold(options.model, distanceMetric, options.threshold)
     const totalStartedAt = performance.now()
 
     try {
@@ -233,6 +255,7 @@ export class FaceRecognition {
         branch: 'reference',
         runId,
         source: options.reference,
+        model: options.model,
         signal: options.signal,
         onUpdate: options.onUpdate,
       })
@@ -242,6 +265,7 @@ export class FaceRecognition {
         branch: 'probe',
         runId,
         source: options.probe,
+        model: options.model,
         signal: options.signal,
         onUpdate: options.onUpdate,
       })
@@ -256,9 +280,9 @@ export class FaceRecognition {
           message: 'Comparing reference and probe embeddings.',
         }),
       )
-      const similarity = cosineSimilarity(reference.embedding, probe.embedding)
+      const similarity = compareEmbeddings(reference.embedding, probe.embedding, distanceMetric)
       const compareMs = elapsed(compareStartedAt)
-      const decision = decide(similarity, threshold)
+      const decision = decide(similarity, threshold, distanceMetric)
 
       options.onUpdate?.(
         createUpdate({
@@ -278,6 +302,7 @@ export class FaceRecognition {
       return {
         runId,
         model: options.model,
+        distanceMetric,
         similarity,
         decision,
         reference: {
@@ -316,7 +341,8 @@ export class FaceRecognition {
   ): Promise<FaceRecognitionRunHandle> {
     const runId = createRunId()
     const intervalMs = options.intervalMs ?? 1000
-    const threshold = options.threshold ?? DEFAULT_THRESHOLD
+    const distanceMetric = getDistanceMetric(options.model, options.distanceMetric)
+    const threshold = getThreshold(options.model, distanceMetric, options.threshold)
     const controller = new AbortController()
     let state: 'running' | 'paused' | 'stopped' = 'running'
     let timer: number | undefined
@@ -328,6 +354,7 @@ export class FaceRecognition {
         branch: 'reference',
         runId,
         source: options.reference,
+        model: options.model,
         signal: controller.signal,
         onUpdate: options.onUpdate,
       })
@@ -351,6 +378,7 @@ export class FaceRecognition {
             options.probe.type === 'video'
               ? { type: 'video', video: options.probe.video }
               : { type: 'media-stream', stream: options.probe.stream },
+          model: options.model,
           signal: controller.signal,
           onUpdate: options.onUpdate,
         })
@@ -365,9 +393,9 @@ export class FaceRecognition {
             message: 'Comparing enrolled reference and live probe embeddings.',
           }),
         )
-        const similarity = cosineSimilarity(reference.embedding, probe.embedding)
+        const similarity = compareEmbeddings(reference.embedding, probe.embedding, distanceMetric)
         const compareMs = elapsed(compareStartedAt)
-        const decision = decide(similarity, threshold)
+        const decision = decide(similarity, threshold, distanceMetric)
 
         options.onUpdate?.(
           createUpdate({
@@ -387,6 +415,7 @@ export class FaceRecognition {
         const result: FaceRecognitionResult = {
           runId: probeRunId,
           model: options.model,
+          distanceMetric,
           similarity,
           decision,
           reference: {
@@ -454,12 +483,14 @@ export class FaceRecognition {
     branch,
     runId,
     source,
+    model,
     signal,
     onUpdate,
   }: {
     branch: Branch
     runId: string
     source: FaceRecognitionSource
+    model: FaceRecognitionModel
     signal?: AbortSignal
     onUpdate?: (update: FaceRecognitionPipelineUpdate) => void
   }): Promise<ProcessedFace> {
@@ -590,7 +621,7 @@ export class FaceRecognition {
     let embeddingMs = 0
     try {
       this.assertNotAborted(signal)
-      embedding = await this.embedder.embed(croppedFace)
+      embedding = await this.embedder.embed(croppedFace, model)
       embeddingMs = elapsed(embeddingStartedAt)
       onUpdate?.(
         createUpdate({
@@ -1049,10 +1080,71 @@ function meanPoint(points: readonly Point[]): Point {
   }
 }
 
+function compareEmbeddings(
+  reference: Float32Array,
+  probe: Float32Array,
+  distanceMetric: FaceRecognitionDistanceMetric,
+): number {
+  if (distanceMetric === 'norm_l2') {
+    return normL2Distance(normalizeEmbedding(reference), normalizeEmbedding(probe))
+  }
+
+  return cosineSimilarity(normalizeEmbedding(reference), normalizeEmbedding(probe))
+}
+
+function getDistanceMetric(
+  model: FaceRecognitionModel,
+  distanceMetric?: FaceRecognitionDistanceMetric,
+): FaceRecognitionDistanceMetric {
+  if (model === 'sface') return distanceMetric ?? 'cosine'
+  return 'cosine'
+}
+
+function getThreshold(
+  model: FaceRecognitionModel,
+  distanceMetric: FaceRecognitionDistanceMetric,
+  threshold?: { match: number; mismatch: number },
+): { match: number; mismatch: number } {
+  if (threshold) return threshold
+  if (model === 'sface' && distanceMetric === 'norm_l2') return DEFAULT_SFACE_NORM_L2_THRESHOLD
+  if (model === 'sface') return DEFAULT_SFACE_COSINE_THRESHOLD
+  return DEFAULT_THRESHOLD
+}
+
+function normalizeEmbedding(values: Float32Array): Float32Array {
+  let magnitude = 0
+  for (let i = 0; i < values.length; i += 1) {
+    magnitude += values[i]! * values[i]!
+  }
+
+  magnitude = Math.sqrt(magnitude)
+  if (!Number.isFinite(magnitude) || magnitude === 0) {
+    throw createFaceRecognitionError({
+      code: 'comparison-failed',
+      message: 'Embedding has invalid magnitude.',
+      stage: 'comparing',
+    })
+  }
+
+  const normalized = new Float32Array(values.length)
+  for (let i = 0; i < values.length; i += 1) {
+    normalized[i] = values[i]! / magnitude
+  }
+
+  return normalized
+}
+
 function decide(
   similarity: number,
   threshold: { match: number; mismatch: number },
+  distanceMetric: FaceRecognitionDistanceMetric,
 ): FaceRecognitionDecision {
+  if (distanceMetric === 'norm_l2') {
+    if (similarity <= threshold.match) return 'match'
+    if (similarity > threshold.mismatch) return 'mismatch'
+    return 'uncertain'
+  }
+
   if (similarity >= threshold.match) return 'match'
   if (similarity < threshold.mismatch) return 'mismatch'
   return 'uncertain'

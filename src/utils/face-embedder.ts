@@ -1,9 +1,10 @@
 import type * as OrtType from 'onnxruntime-web'
 
 const EMBEDDING_INPUT_SIZE = 112
-const EMBEDDING_LENGTH = 512
-const DEFAULT_MODEL_URL =
+const DEFAULT_ARCFACE_MODEL_URL =
   'https://static.tpsentinel.com/vendor/onnx/models/w600k_mbf.onnx'
+const DEFAULT_SFACE_MODEL_URL =
+  'https://static.tpsentinel.com/vendor/onnx/models/face_recognition_sface_2021dec_int8.onnx'
 const DEFAULT_ORT_WASM_BASE_URL =
   'https://static.tpsentinel.com/vendor/onnx/runtime-web/'
 
@@ -15,8 +16,14 @@ const defaultOrtLoader: OrtLoader = () => import('onnxruntime-web')
 let activeOrtLoader: OrtLoader = defaultOrtLoader
 
 export type FaceEmbedderOptions = {
-  modelUrl?: string
+  modelUrls?: Partial<Record<FaceEmbeddingModel, string>>
   wasmBaseUrl?: string
+}
+export type FaceEmbeddingModel = 'arcface-mbf' | 'sface'
+export type FaceEmbeddingProfile = {
+  model: FaceEmbeddingModel
+  modelUrl: string
+  embeddingLength: number
 }
 
 export const setOrtLoader = (loader?: OrtLoader): void => {
@@ -24,45 +31,36 @@ export const setOrtLoader = (loader?: OrtLoader): void => {
 }
 
 export class FaceEmbedder {
-  private readonly modelUrl: string
+  private readonly modelUrls: Record<FaceEmbeddingModel, string>
   private readonly wasmBaseUrl: string
   private onnxRuntime: OrtModule | null = null
-  private session: OrtSession | null = null
+  private sessions = new Map<FaceEmbeddingModel, OrtSession>()
   private inputBuffer = new Float32Array(3 * EMBEDDING_INPUT_SIZE * EMBEDDING_INPUT_SIZE)
 
   constructor(options: FaceEmbedderOptions = {}) {
-    this.modelUrl = options.modelUrl ?? DEFAULT_MODEL_URL
+    this.modelUrls = {
+      'arcface-mbf': options.modelUrls?.['arcface-mbf'] ?? DEFAULT_ARCFACE_MODEL_URL,
+      sface: options.modelUrls?.sface ?? DEFAULT_SFACE_MODEL_URL,
+    }
     this.wasmBaseUrl = ensureTrailingSlash(options.wasmBaseUrl ?? DEFAULT_ORT_WASM_BASE_URL)
   }
 
   async init(): Promise<void> {
-    if (this.session) return
+    if (this.onnxRuntime) return
 
     try {
       console.info('[FaceEmbedder] Loading ONNX Runtime Web.')
       this.onnxRuntime = await activeOrtLoader()
       console.info('[FaceEmbedder] Configuring ONNX Runtime.', {
         ortVersion: this.onnxRuntime.env.versions,
-        modelUrl: this.modelUrl,
+        modelUrls: this.modelUrls,
         wasmBaseUrl: this.wasmBaseUrl,
       })
       this.onnxRuntime.env.wasm.wasmPaths = this.wasmBaseUrl
       this.onnxRuntime.env.wasm.numThreads = 1
-      const modelBytes = await fetchModelBytes(this.modelUrl)
-      console.info('[FaceEmbedder] Creating ONNX embedding session.', {
-        modelUrl: this.modelUrl,
-        byteLength: modelBytes.byteLength,
-      })
-      this.session = await this.onnxRuntime.InferenceSession.create(modelBytes, {
-        executionProviders: ['wasm'],
-      })
-      console.info('[FaceEmbedder] ONNX embedding session ready.', {
-        inputNames: this.session.inputNames,
-        outputNames: this.session.outputNames,
-      })
     } catch (error) {
       console.error('[FaceEmbedder] Failed to initialize ONNX embedding session.', {
-        modelUrl: this.modelUrl,
+        modelUrls: this.modelUrls,
         wasmBaseUrl: this.wasmBaseUrl,
         error,
       })
@@ -70,36 +68,64 @@ export class FaceEmbedder {
     }
   }
 
-  async embed(face: ImageBitmap): Promise<Float32Array> {
-    if (!this.onnxRuntime || !this.session) {
+  async embed(face: ImageBitmap, model: FaceEmbeddingModel): Promise<Float32Array> {
+    if (!this.onnxRuntime) {
       throw new Error('FaceEmbedder is not initialized. Call init() first.')
     }
 
+    const profile = getEmbeddingProfile(model, this.modelUrls[model])
+    const session = await this.getSession(profile)
     const tensor = new this.onnxRuntime.Tensor(
       'float32',
-      this.createInputBuffer(face),
+      this.createInputBuffer(face, model),
       [1, 3, EMBEDDING_INPUT_SIZE, EMBEDDING_INPUT_SIZE],
     )
-    const outputs = await this.session.run({ [this.session.inputNames[0]!]: tensor })
-    const embedding = extractEmbedding(outputs, this.session.outputNames)
+    const outputs = await session.run({ [session.inputNames[0]!]: tensor })
+    const embedding = extractEmbedding(outputs, session.outputNames)
 
-    if (embedding.length !== EMBEDDING_LENGTH) {
+    if (embedding.length !== profile.embeddingLength) {
       throw new Error(
-        `Face embedding model produced ${embedding.length} values; expected ${EMBEDDING_LENGTH}.`,
+        `${model} produced ${embedding.length} values; expected ${profile.embeddingLength}.`,
       )
     }
 
-    return normalizeL2(embedding)
+    return model === 'sface' ? new Float32Array(embedding) : normalizeL2(embedding)
   }
 
   async close(): Promise<void> {
-    if (!this.session) return
+    const sessions = Array.from(this.sessions.values())
+    this.sessions.clear()
 
-    await this.session.release()
-    this.session = null
+    await Promise.all(sessions.map((session) => session.release()))
   }
 
-  private createInputBuffer(face: ImageBitmap): Float32Array {
+  private async getSession(profile: FaceEmbeddingProfile): Promise<OrtSession> {
+    if (!this.onnxRuntime) {
+      throw new Error('FaceEmbedder is not initialized. Call init() first.')
+    }
+
+    const cachedSession = this.sessions.get(profile.model)
+    if (cachedSession) return cachedSession
+
+    const modelBytes = await fetchModelBytes(profile.modelUrl)
+    console.info('[FaceEmbedder] Creating ONNX embedding session.', {
+      model: profile.model,
+      modelUrl: profile.modelUrl,
+      byteLength: modelBytes.byteLength,
+    })
+    const session = await this.onnxRuntime.InferenceSession.create(modelBytes, {
+      executionProviders: ['wasm'],
+    })
+    console.info('[FaceEmbedder] ONNX embedding session ready.', {
+      model: profile.model,
+      inputNames: session.inputNames,
+      outputNames: session.outputNames,
+    })
+    this.sessions.set(profile.model, session)
+    return session
+  }
+
+  private createInputBuffer(face: ImageBitmap, model: FaceEmbeddingModel): Float32Array {
     const canvas = document.createElement('canvas')
     canvas.width = EMBEDDING_INPUT_SIZE
     canvas.height = EMBEDDING_INPUT_SIZE
@@ -115,12 +141,33 @@ export class FaceEmbedder {
 
     for (let i = 0; i < planeSize; i += 1) {
       const pixelOffset = i * 4
-      this.inputBuffer[i] = (pixels[pixelOffset + 2]! - 127.5) / 127.5
-      this.inputBuffer[planeSize + i] = (pixels[pixelOffset + 1]! - 127.5) / 127.5
-      this.inputBuffer[planeSize * 2 + i] = (pixels[pixelOffset]! - 127.5) / 127.5
+      const blue = pixels[pixelOffset + 2]!
+      const green = pixels[pixelOffset + 1]!
+      const red = pixels[pixelOffset]!
+
+      if (model === 'sface') {
+        this.inputBuffer[i] = blue
+        this.inputBuffer[planeSize + i] = green
+        this.inputBuffer[planeSize * 2 + i] = red
+      } else {
+        this.inputBuffer[i] = (blue - 127.5) / 127.5
+        this.inputBuffer[planeSize + i] = (green - 127.5) / 127.5
+        this.inputBuffer[planeSize * 2 + i] = (red - 127.5) / 127.5
+      }
     }
 
     return this.inputBuffer
+  }
+}
+
+export function getEmbeddingProfile(
+  model: FaceEmbeddingModel,
+  modelUrl: string,
+): FaceEmbeddingProfile {
+  return {
+    model,
+    modelUrl,
+    embeddingLength: model === 'sface' ? 128 : 512,
   }
 }
 
@@ -137,6 +184,22 @@ export function cosineSimilarity(reference: Float32Array, probe: Float32Array): 
   }
 
   return similarity
+}
+
+export function normL2Distance(reference: Float32Array, probe: Float32Array): number {
+  if (reference.length !== probe.length) {
+    throw new Error(
+      `Cannot compare embeddings with different lengths (${reference.length} and ${probe.length}).`,
+    )
+  }
+
+  let distance = 0
+  for (let i = 0; i < reference.length; i += 1) {
+    const delta = reference[i]! - probe[i]!
+    distance += delta * delta
+  }
+
+  return Math.sqrt(distance)
 }
 
 function extractEmbedding(
