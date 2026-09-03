@@ -4,6 +4,8 @@
     "module": "esnext",
     "lib": ["ES2023", "DOM"],
     "types": ["vite/client"],
+    "jsx": "preserve",
+    "jsxImportSource": "solid-js",
     "allowArbitraryExtensions": true,
     "skipLibCheck": true,
 
