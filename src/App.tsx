@@ -1,65 +1,120 @@
-import { Show, createEffect, createMemo, createSignal, onCleanup } from 'solid-js'
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, type JSX } from 'solid-js'
+import {
+  FaceRecognition,
+  type FaceDetectionSummary,
+  type FaceRecognitionPipelineUpdate,
+  type FaceRecognitionResult,
+  type FaceRecognitionRunHandle,
+  type FaceRecognitionStage,
+} from './utils/face-recognition'
 
 type ProbeMode = 'static' | 'live'
+type SourceDimensions = { width: number; height: number }
+type PipelineRow = FaceRecognitionPipelineUpdate
+type CropPreview = {
+  title: string
+  detail: string
+  url: string
+}
+
+const STAGE_LABELS: Record<FaceRecognitionStage, string> = {
+  'source-ready': 'Image Ingest',
+  'face-detecting': 'Detection',
+  'face-detected': 'Detection',
+  'face-rejected': 'Detection',
+  'face-cropping': 'Align & Crop',
+  'face-cropped': 'Align & Crop',
+  'embedding-running': '512-d Vector',
+  'embedding-ready': '512-d Vector',
+  comparing: 'Cosine Compare',
+  completed: 'Cosine Compare',
+  failed: 'Failed',
+}
 
 export function App() {
   let referenceInputRef: HTMLInputElement | undefined
   let probeInputRef: HTMLInputElement | undefined
   let videoRef: HTMLVideoElement | undefined
+  let recognizerPromise: Promise<FaceRecognition> | undefined
   let referenceObjectUrl: string | undefined
   let probeObjectUrl: string | undefined
+  let referenceCropObjectUrl: string | undefined
+  let probeCropObjectUrl: string | undefined
+  let activeRunId: string | undefined
+  let continuousRun: FaceRecognitionRunHandle | undefined
 
+  const [referenceFile, setReferenceFile] = createSignal<File>()
+  const [probeFile, setProbeFile] = createSignal<File>()
   const [referencePreview, setReferencePreview] = createSignal<string>()
   const [probePreview, setProbePreview] = createSignal<string>()
+  const [referenceCropPreview, setReferenceCropPreview] = createSignal<string>()
+  const [probeCropPreview, setProbeCropPreview] = createSignal<string>()
+  const [referenceFace, setReferenceFace] = createSignal<FaceDetectionSummary>()
+  const [probeFace, setProbeFace] = createSignal<FaceDetectionSummary>()
+  const [referenceDimensions, setReferenceDimensions] = createSignal<SourceDimensions>()
+  const [probeDimensions, setProbeDimensions] = createSignal<SourceDimensions>()
   const [probeMode, setProbeMode] = createSignal<ProbeMode>('static')
   const [cameraStream, setCameraStream] = createSignal<MediaStream>()
   const [cameraError, setCameraError] = createSignal<string>()
   const [isStartingCamera, setIsStartingCamera] = createSignal(false)
-  const [verificationScore, setVerificationScore] = createSignal<string>()
+  const [isVerifying, setIsVerifying] = createSignal(false)
+  const [isContinuousRunning, setIsContinuousRunning] = createSignal(false)
+  const [result, setResult] = createSignal<FaceRecognitionResult>()
+  const [pipelineRows, setPipelineRows] = createSignal<PipelineRow[]>([])
+  const [cropPreview, setCropPreview] = createSignal<CropPreview>()
 
   const hasProbe = createMemo(() =>
-    probeMode() === 'live' ? Boolean(cameraStream()) : Boolean(probePreview()),
+    probeMode() === 'live' ? Boolean(cameraStream()) : Boolean(probeFile()),
   )
-  const isReady = createMemo(() => Boolean(referencePreview()) && hasProbe())
+  const isReady = createMemo(() => Boolean(referenceFile()) && hasProbe() && !isVerifying())
+  const referenceRows = createMemo(() => pipelineRows().filter((row) => row.branch === 'reference'))
+  const probeRows = createMemo(() => pipelineRows().filter((row) => row.branch === 'probe'))
+  const referenceTotalMs = createMemo(() => totalDuration(referenceRows()))
+  const probeTotalMs = createMemo(() => totalDuration(probeRows()))
+  const score = createMemo(() => result()?.similarity.toFixed(3) ?? '0.000')
+  const scorePercent = createMemo(() => `${Math.round(Number(score()) * 1000) / 10}%`)
 
   const pipelineStatus = createMemo(() => {
     if (cameraError()) return 'Camera unavailable'
-    if (verificationScore()) return 'Verification complete'
+    if (isContinuousRunning()) return 'Continuous pipeline'
+    if (isVerifying()) return 'Pipeline running'
+    if (result()) return 'Verification complete'
     if (isReady()) return 'Pipeline Active'
-    if (!referencePreview()) return hasProbe() ? 'Reference Required' : 'Awaiting Inputs'
+    if (!referenceFile()) return hasProbe() ? 'Reference Required' : 'Awaiting Inputs'
     return 'Probe Required'
   })
 
   const resultTitle = createMemo(() => {
     if (cameraError()) return 'CAMERA UNAVAILABLE'
-    if (verificationScore()) return 'VERIFICATION SIMULATED'
+    if (isContinuousRunning()) return 'CONTINUOUS PIPELINE'
+    if (isVerifying()) return 'PIPELINE RUNNING'
+    if (result()) return result()?.decision === 'match' ? 'VERIFIED MATCH' : 'REVIEW REQUIRED'
     if (isReady()) return 'READY TO VERIFY'
-    if (!referencePreview() && !hasProbe()) return 'AWAITING INPUTS'
-    if (!referencePreview()) return 'REFERENCE REQUIRED'
+    if (!referenceFile() && !hasProbe()) return 'AWAITING INPUTS'
+    if (!referenceFile()) return 'REFERENCE REQUIRED'
     return 'PROBE REQUIRED'
   })
 
   const resultDetail = createMemo(() => {
     if (cameraError()) return cameraError()
-    if (verificationScore()) {
-      return `Similarity score ${verificationScore()}. Recognition model integration can be added next.`
+    if (isContinuousRunning()) return 'Live probe frames are being checked continuously.'
+    if (isVerifying()) return 'MediaPipe is detecting faces and preparing crops.'
+    if (result()) {
+      return `Similarity score ${score()}. Recognition used the configured 512-d ONNX embedding model.`
     }
     if (isReady()) {
       return probeMode() === 'live'
         ? 'Live webcam frames are available for probe evaluation.'
         : 'The uploaded probe image is available for static evaluation.'
     }
-    if (!referencePreview() && !hasProbe()) {
+    if (!referenceFile() && !hasProbe()) {
       return 'Upload a reference image, then provide a probe candidate.'
     }
-    if (!referencePreview()) return 'Choose a reference image before verification.'
+    if (!referenceFile()) return 'Choose a reference image before verification.'
     return probeMode() === 'live'
       ? 'Allow webcam access to start live probe evaluation.'
-      : 'Choose a static probe image or switch to live stream.'
+      : 'Choose a static probe image or switch to webcam stream.'
   })
-
-  const score = createMemo(() => verificationScore() ?? '0.000')
-  const scorePercent = createMemo(() => `${Math.round(Number(score()) * 1000) / 10}%`)
 
   createEffect(() => {
     const stream = cameraStream()
@@ -69,8 +124,66 @@ export function App() {
     }
   })
 
+  function getRecognizer() {
+    recognizerPromise ??= FaceRecognition.create({
+      modelBaseUrl: `${import.meta.env.BASE_URL}models`,
+      wasmBaseUrl: `${import.meta.env.BASE_URL}wasm`,
+      embeddingModelUrl: 'https://static.tpsentinel.com/vendor/onnx/models/w600k_mbf.onnx',
+      onnxWasmBaseUrl: 'https://static.tpsentinel.com/vendor/onnx/runtime-web/',
+    })
+    return recognizerPromise
+  }
+
   function revokeUrl(url: string | undefined) {
     if (url) URL.revokeObjectURL(url)
+  }
+
+  async function imageBitmapToUrl(bitmap: ImageBitmap): Promise<string> {
+    const canvas = document.createElement('canvas')
+    canvas.width = bitmap.width
+    canvas.height = bitmap.height
+    const context = canvas.getContext('2d')
+
+    if (!context) {
+      throw new Error('Could not create preview canvas.')
+    }
+
+    context.drawImage(bitmap, 0, 0)
+    const blob = await new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob((value) => {
+        if (value) resolve(value)
+        else reject(new Error('Could not create cropped preview blob.'))
+      }, 'image/png')
+    })
+
+    return URL.createObjectURL(blob)
+  }
+
+  function resetRecognitionOutput() {
+    activeRunId = undefined
+    setResult(undefined)
+    setPipelineRows([])
+    setReferenceFace(undefined)
+    setProbeFace(undefined)
+    setReferenceDimensions(undefined)
+    setProbeDimensions(undefined)
+    revokeUrl(referenceCropObjectUrl)
+    revokeUrl(probeCropObjectUrl)
+    referenceCropObjectUrl = undefined
+    probeCropObjectUrl = undefined
+    setReferenceCropPreview(undefined)
+    setProbeCropPreview(undefined)
+    setCropPreview(undefined)
+  }
+
+  async function stopContinuousRun() {
+    if (!continuousRun) {
+      return
+    }
+
+    await continuousRun.stop()
+    continuousRun = undefined
+    setIsContinuousRunning(false)
   }
 
   function handleReferenceUpload(event: Event) {
@@ -81,8 +194,10 @@ export function App() {
 
     revokeUrl(referenceObjectUrl)
     referenceObjectUrl = URL.createObjectURL(file)
+    setReferenceFile(file)
     setReferencePreview(referenceObjectUrl)
-    setVerificationScore(undefined)
+    void stopContinuousRun()
+    resetRecognitionOutput()
   }
 
   function handleProbeUpload(event: Event) {
@@ -93,13 +208,15 @@ export function App() {
 
     revokeUrl(probeObjectUrl)
     probeObjectUrl = URL.createObjectURL(file)
+    setProbeFile(file)
     setProbePreview(probeObjectUrl)
-    setVerificationScore(undefined)
+    void stopContinuousRun()
+    resetRecognitionOutput()
   }
 
   async function selectLiveMode() {
     setProbeMode('live')
-    setVerificationScore(undefined)
+    resetRecognitionOutput()
 
     if (!cameraStream()) {
       await startCamera()
@@ -108,7 +225,8 @@ export function App() {
 
   function selectStaticMode() {
     setProbeMode('static')
-    setVerificationScore(undefined)
+    void stopContinuousRun()
+    resetRecognitionOutput()
     stopCamera()
   }
 
@@ -133,6 +251,7 @@ export function App() {
   }
 
   function stopCamera() {
+    void stopContinuousRun()
     cameraStream()?.getTracks().forEach((track) => track.stop())
     setCameraStream(undefined)
   }
@@ -140,6 +259,7 @@ export function App() {
   function toggleCamera() {
     if (cameraStream()) {
       stopCamera()
+      resetRecognitionOutput()
       return
     }
 
@@ -147,18 +267,123 @@ export function App() {
   }
 
   function resetWorkbench() {
-    setVerificationScore(undefined)
     setCameraError(undefined)
+    void stopContinuousRun()
+    resetRecognitionOutput()
   }
 
-  function verifyCandidate() {
-    setVerificationScore(probeMode() === 'live' ? '0.781' : '0.736')
+  function handlePipelineUpdate(update: FaceRecognitionPipelineUpdate) {
+    if (activeRunId !== update.runId) {
+      activeRunId = update.runId
+      setPipelineRows((rows) =>
+        update.branch === 'probe' ? rows.filter((row) => row.branch === 'reference') : [],
+      )
+    }
+
+    setPipelineRows((rows) => [...rows, update])
+
+    const sourceImage = update.data?.sourceImage
+    if (sourceImage) {
+      const dimensions = { width: sourceImage.width, height: sourceImage.height }
+      if (update.branch === 'reference') setReferenceDimensions(dimensions)
+      else setProbeDimensions(dimensions)
+    }
+
+    const face = update.data?.detectedFaces?.[0]
+    if (face) {
+      if (update.branch === 'reference') setReferenceFace(face)
+      else setProbeFace(face)
+    }
+
+    const croppedFace = update.data?.croppedFace
+    if (croppedFace) {
+      void imageBitmapToUrl(croppedFace).then((url) => {
+        if (update.branch === 'reference') {
+          revokeUrl(referenceCropObjectUrl)
+          referenceCropObjectUrl = url
+          setReferenceCropPreview(url)
+        } else {
+          revokeUrl(probeCropObjectUrl)
+          probeCropObjectUrl = url
+          setProbeCropPreview(url)
+        }
+      })
+    }
+  }
+
+  async function verifyCandidate() {
+    const reference = referenceFile()
+
+    if (!reference) {
+      return
+    }
+
+    try {
+      setCameraError(undefined)
+      setIsVerifying(true)
+      const recognizer = await getRecognizer()
+      const probeSource = (() => {
+        if (probeMode() === 'live') {
+          if (!videoRef) return
+          return { type: 'video' as const, video: videoRef }
+        }
+
+        const probe = probeFile()
+        if (!probe) return
+        return { type: 'image-file' as const, file: probe }
+      })()
+
+      if (!probeSource) {
+        return
+      }
+
+      const nextResult = await recognizer.checkOnce({
+        model: 'arcface-mbf',
+        reference: { type: 'image-file', file: reference },
+        probe: probeSource,
+        onUpdate: handlePipelineUpdate,
+      })
+      setResult(nextResult)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Face recognition failed.'
+      setCameraError(message)
+    } finally {
+      setIsVerifying(false)
+    }
+  }
+
+  async function startContinuousPipeline() {
+    const reference = referenceFile()
+    const video = videoRef
+
+    if (!reference || !video || probeMode() !== 'live') {
+      return
+    }
+
+    await stopContinuousRun()
+    setCameraError(undefined)
+    const recognizer = await getRecognizer()
+    continuousRun = await recognizer.startContinuous({
+      model: 'arcface-mbf',
+      reference: { type: 'image-file', file: reference },
+      probe: { type: 'video', video },
+      intervalMs: 1000,
+      onUpdate: handlePipelineUpdate,
+      onResult: setResult,
+      onError: (error) => {
+        setCameraError(error.message)
+      },
+    })
+    setIsContinuousRunning(true)
   }
 
   onCleanup(() => {
+    void stopContinuousRun()
     stopCamera()
     revokeUrl(referenceObjectUrl)
     revokeUrl(probeObjectUrl)
+    revokeUrl(referenceCropObjectUrl)
+    revokeUrl(probeCropObjectUrl)
   })
 
   return (
@@ -218,69 +443,26 @@ export function App() {
 
       <main class="mx-auto flex w-full max-w-[1440px] flex-col gap-6 px-4 py-6 sm:px-6">
         <section class="grid grid-cols-1 gap-6 lg:grid-cols-2" aria-label="Face comparison inputs">
-          <article class="flex flex-col gap-4 rounded-xl border border-slate-200 bg-white p-5 shadow-[0_1px_3px_rgba(15,23,42,0.04),0_1px_2px_rgba(15,23,42,0.04)]">
-            <div class="flex items-center justify-between gap-3 border-b border-slate-100 pb-1">
-              <div class="flex min-w-0 items-center gap-2">
-                <span class="flex size-5 shrink-0 items-center justify-center rounded border border-slate-200 bg-slate-100 font-mono text-xs font-semibold text-slate-700">
-                  1
-                </span>
-                <h2 class="text-sm font-semibold tracking-tight text-slate-900">Reference Face</h2>
-                <span class="hidden text-xs font-normal text-slate-500 sm:inline">(Enrolled Model)</span>
-              </div>
-              <div class="inline-flex rounded-md border border-slate-200 bg-slate-100 p-0.5 text-xs font-medium">
-                <span class="rounded border border-slate-200/70 bg-white px-2.5 py-1 font-medium text-slate-900 shadow-sm">
-                  Static Image
-                </span>
-              </div>
-            </div>
-
-            <div class="relative flex aspect-[4/3] w-full items-center justify-center overflow-hidden rounded-lg border border-slate-200 bg-slate-50">
-              <Show
-                when={referencePreview()}
-                fallback={
-                  <button
-                    class="absolute inset-0 flex cursor-pointer flex-col items-center justify-center bg-white/95 p-6 text-center transition-colors hover:bg-slate-50"
-                    type="button"
-                    onClick={() => referenceInputRef?.click()}
-                  >
-                    <div class="mb-2 flex size-10 items-center justify-center rounded-full bg-slate-100 text-slate-500">
-                      <span class="material-symbols-outlined text-xl">image</span>
-                    </div>
-                    <h3 class="text-sm font-semibold text-slate-900">No Reference Enrolled</h3>
-                    <p class="mt-1 max-w-xs text-xs text-slate-500">
-                      Upload a biometric image to create the reference enrollment.
-                    </p>
-                  </button>
-                }
-              >
-                {(src) => (
-                  <>
-                    <img class="size-full object-cover" src={src()} alt="Uploaded reference face" />
-                    <div class="pointer-events-none absolute inset-0 flex items-center justify-center">
-                      <div class="relative h-56 w-48 rounded-md border border-slate-900/60 bg-slate-900/5 shadow-sm">
-                        <span class="absolute -top-2.5 left-2.5 rounded bg-slate-900 px-1.5 py-0.5 font-mono text-[10px] text-white shadow-sm">
-                          Ref ID: #00
-                        </span>
-                      </div>
-                    </div>
-                    <div class="pointer-events-none absolute left-3 top-3">
-                      <span class="inline-flex items-center gap-1.5 rounded-md border border-slate-200 bg-white/95 px-2.5 py-1 text-xs font-medium text-slate-800 shadow-sm backdrop-blur">
-                        <span class="size-2 rounded-full bg-emerald-500"></span>
-                        Reference loaded
-                      </span>
-                    </div>
-                  </>
-                )}
-              </Show>
-            </div>
-
-            <div class="flex items-center justify-between gap-4 rounded-lg border border-slate-200 bg-slate-50 p-3">
-              <div class="min-w-0">
-                <p class="text-xs font-semibold text-slate-800">
-                  {referencePreview() ? 'Reference image ready' : 'Reference image required'}
-                </p>
-                <p class="mt-0.5 font-mono text-xs text-slate-500">Upload-only enrollment source</p>
-              </div>
+          <ImagePanel
+            branch="reference"
+            title="Reference Face"
+            subtitle="(Enrolled Model)"
+            modeLabel="Static Image"
+            imageUrl={referencePreview()}
+            croppedUrl={referenceCropPreview()}
+            face={referenceFace()}
+            dimensions={referenceDimensions()}
+            onEmptyClick={() => referenceInputRef?.click()}
+            metadataTitle={referenceCropPreview() ? 'Cropped reference ready' : 'Reference image required'}
+            metadataDetail="Reference enrollment source"
+            onPreviewCrop={(url) =>
+              setCropPreview({
+                title: 'Cropped Reference',
+                detail: 'Reference enrollment crop',
+                url,
+              })
+            }
+            action={
               <label
                 class="flex shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 shadow-sm transition-colors hover:bg-slate-50 hover:text-slate-900"
                 for="reference-input"
@@ -296,18 +478,14 @@ export function App() {
                   onChange={handleReferenceUpload}
                 />
               </label>
-            </div>
-          </article>
+            }
+          />
 
-          <article class="flex flex-col gap-4 rounded-xl border border-slate-200 bg-white p-5 shadow-[0_1px_3px_rgba(15,23,42,0.04),0_1px_2px_rgba(15,23,42,0.04)]">
-            <div class="flex items-center justify-between gap-3 border-b border-slate-100 pb-1">
-              <div class="flex min-w-0 items-center gap-2">
-                <span class="flex size-5 shrink-0 items-center justify-center rounded border border-slate-200 bg-slate-100 font-mono text-xs font-semibold text-slate-700">
-                  2
-                </span>
-                <h2 class="text-sm font-semibold tracking-tight text-slate-900">Probe Candidate</h2>
-                <span class="hidden text-xs font-normal text-slate-500 sm:inline">(Live Evaluation)</span>
-              </div>
+          <ImagePanel
+            branch="probe"
+            title="Probe Candidate"
+            subtitle="(Live Evaluation)"
+            modeLabel={
               <div class="inline-flex rounded-md border border-slate-200 bg-slate-100 p-0.5 text-xs font-medium">
                 <button
                   class="rounded px-2.5 py-1 text-slate-600 transition-colors hover:text-slate-900"
@@ -332,93 +510,40 @@ export function App() {
                   Static Image
                 </button>
               </div>
-            </div>
+            }
+            imageUrl={probeMode() === 'static' ? probePreview() : undefined}
+            videoRef={(element) => {
+              videoRef = element
+            }}
+            showVideo={probeMode() === 'live' && Boolean(cameraStream())}
+            croppedUrl={probeCropPreview()}
+            face={probeFace()}
+            dimensions={probeDimensions()}
+            mirrored={probeMode() === 'live'}
+            onEmptyClick={() => {
+              if (probeMode() === 'live') {
+                void startCamera()
+                return
+              }
 
-            <div class="relative flex aspect-[4/3] w-full items-center justify-center overflow-hidden rounded-lg border border-slate-200 bg-slate-50">
-              <Show when={probeMode() === 'static' && probePreview()}>
-                <img class="size-full object-cover" src={probePreview()} alt="Uploaded probe candidate" />
-              </Show>
-
-              <Show when={probeMode() === 'live' && cameraStream()}>
-                <>
-                  <video
-                    ref={videoRef}
-                    class="size-full scale-x-[-1] object-cover"
-                    autoplay
-                    muted
-                    playsinline
-                  />
-                  <div class="pointer-events-none absolute bottom-3 left-3">
-                    <span class="inline-flex items-center gap-1.5 rounded border border-slate-200 bg-white/90 px-2 py-0.5 font-mono text-[11px] text-slate-600 shadow-sm backdrop-blur">
-                      <span class="size-1.5 rounded-full bg-emerald-500"></span>
-                      30.0 FPS
-                    </span>
-                  </div>
-                </>
-              </Show>
-
-              <Show when={hasProbe()}>
-                <div class="pointer-events-none absolute inset-0 flex items-center justify-center">
-                  <div class="relative h-56 w-48 rounded-md border border-slate-900/60 bg-slate-900/5 shadow-sm">
-                    <span class="absolute -top-2.5 left-2.5 rounded bg-slate-900 px-1.5 py-0.5 font-mono text-[10px] text-white shadow-sm">
-                      Candidate #0
-                    </span>
-                    <span class="absolute left-[28%] top-[35%] size-1.5 rounded-full bg-slate-900"></span>
-                    <span class="absolute right-[28%] top-[35%] size-1.5 rounded-full bg-slate-900"></span>
-                    <span class="absolute left-[48%] top-[52%] size-1.5 rounded-full bg-slate-900"></span>
-                    <span class="absolute left-[32%] top-[68%] size-1.5 rounded-full bg-slate-900"></span>
-                    <span class="absolute right-[32%] top-[68%] size-1.5 rounded-full bg-slate-900"></span>
-                  </div>
-                </div>
-                <div class="pointer-events-none absolute left-3 top-3 flex items-center gap-2">
-                  <span class="inline-flex items-center gap-1.5 rounded-md border border-slate-200 bg-white/95 px-2.5 py-1 text-xs font-medium text-slate-800 shadow-sm backdrop-blur">
-                    <span class="size-2 rounded-full bg-emerald-500"></span>
-                    Candidate source ready
-                  </span>
-                </div>
-              </Show>
-
-              <Show when={!hasProbe()}>
-                <button
-                  class="absolute inset-0 flex cursor-pointer flex-col items-center justify-center bg-white/95 p-6 text-center transition-colors hover:bg-slate-50 disabled:cursor-not-allowed"
-                  type="button"
-                  disabled={isStartingCamera()}
-                  onClick={() => {
-                    if (probeMode() === 'live') {
-                      void startCamera()
-                      return
-                    }
-
-                    probeInputRef?.click()
-                  }}
-                >
-                  <div class="mb-2 flex size-10 items-center justify-center rounded-full border border-rose-100 bg-rose-50 text-rose-600">
-                    <span class="material-symbols-outlined text-xl">
-                      {probeMode() === 'live' ? 'videocam' : 'face_retouching_off'}
-                    </span>
-                  </div>
-                  <h3 class="text-sm font-semibold text-slate-900">
-                    {probeMode() === 'live' ? 'Webcam Stream Required' : 'No Candidate Selected'}
-                  </h3>
-                  <p class="mt-1 max-w-xs text-xs text-slate-500">
-                    {probeMode() === 'live'
-                      ? 'Allow camera access to start live evaluation.'
-                      : 'Upload a static candidate image or switch to webcam stream.'}
-                  </p>
-                </button>
-              </Show>
-            </div>
-
-            <div class="flex items-center justify-between gap-4 rounded-lg border border-slate-200 bg-slate-50 p-3">
-              <div class="min-w-0">
-                <p class="text-xs font-semibold text-slate-800">
-                  {hasProbe() ? 'Probe candidate ready' : 'Probe candidate required'}
-                </p>
-                <p class="mt-0.5 font-mono text-xs text-slate-500">
-                  {probeMode() === 'live' ? 'Webcam frame stream' : 'Static probe image'}
-                </p>
-              </div>
-
+              probeInputRef?.click()
+            }}
+            emptyTitle={probeMode() === 'live' ? 'Webcam Stream Required' : 'No Candidate Selected'}
+            emptyDetail={
+              probeMode() === 'live'
+                ? 'Allow camera access to start live evaluation.'
+                : 'Upload a static candidate image or switch to webcam stream.'
+            }
+            metadataTitle={probeCropPreview() ? 'Cropped probe ready' : 'Probe candidate required'}
+            metadataDetail={probeMode() === 'live' ? 'Webcam frame stream' : 'Static probe image'}
+            onPreviewCrop={(url) =>
+              setCropPreview({
+                title: 'Cropped Probe',
+                detail: probeMode() === 'live' ? 'Latest webcam frame crop' : 'Static probe crop',
+                url,
+              })
+            }
+            action={
               <Show
                 when={probeMode() === 'live'}
                 fallback={
@@ -457,9 +582,20 @@ export function App() {
                   </span>
                 </button>
               </Show>
-            </div>
-          </article>
+            }
+          />
         </section>
+
+        <PipelineTimeline
+          referenceRows={referenceRows()}
+          probeRows={probeRows()}
+          referenceTotalMs={referenceTotalMs()}
+          probeTotalMs={probeTotalMs()}
+          canRunContinuous={probeMode() === 'live' && Boolean(referenceFile()) && Boolean(cameraStream())}
+          isContinuousRunning={isContinuousRunning()}
+          onStartContinuous={() => void startContinuousPipeline()}
+          onStopContinuous={() => void stopContinuousRun()}
+        />
 
         <section class="rounded-xl border border-slate-200 bg-white p-5 shadow-[0_1px_3px_rgba(15,23,42,0.04),0_1px_2px_rgba(15,23,42,0.04)] sm:p-6">
           <div class="flex flex-col items-start justify-between gap-6 border-b border-slate-100 pb-5 lg:flex-row lg:items-center">
@@ -467,20 +603,20 @@ export function App() {
               <div
                 class="inline-flex items-center gap-2 rounded-lg border px-3.5 py-2 text-sm font-semibold shadow-sm"
                 classList={{
-                  'border-emerald-200 bg-emerald-50 text-emerald-800': isReady() || Boolean(verificationScore()),
-                  'border-amber-200 bg-amber-50 text-amber-800': !isReady() && !verificationScore() && !cameraError(),
+                  'border-emerald-200 bg-emerald-50 text-emerald-800': isReady() || Boolean(result()),
+                  'border-amber-200 bg-amber-50 text-amber-800': !isReady() && !result() && !cameraError(),
                   'border-rose-200 bg-rose-50 text-rose-800': Boolean(cameraError()),
                 }}
               >
                 <span class="material-symbols-outlined text-[19px]">
-                  {cameraError() ? 'error' : isReady() || verificationScore() ? 'check_circle' : 'pending'}
+                  {cameraError() ? 'error' : isReady() || result() ? 'check_circle' : 'pending'}
                 </span>
                 <span>{resultTitle()}</span>
               </div>
               <div>
                 <p class="text-sm font-semibold text-slate-900">{resultDetail()}</p>
                 <p class="mt-0.5 text-xs text-slate-500">
-                  Operating threshold: 0.650. This POC currently simulates the comparison score.
+                  Operating threshold: 0.650. Embeddings are compared with cosine similarity.
                 </p>
               </div>
             </div>
@@ -506,18 +642,9 @@ export function App() {
             <div class="flex items-center justify-between text-xs text-slate-500">
               <span class="font-medium text-slate-700">Classification Spectrum</span>
               <div class="hidden items-center gap-4 text-[11px] sm:flex">
-                <span class="inline-flex items-center gap-1.5">
-                  <span class="size-2 rounded-full bg-rose-500"></span>
-                  Mismatch
-                </span>
-                <span class="inline-flex items-center gap-1.5">
-                  <span class="size-2 rounded-full bg-amber-500"></span>
-                  Review Zone
-                </span>
-                <span class="inline-flex items-center gap-1.5">
-                  <span class="size-2 rounded-full bg-emerald-600"></span>
-                  Match
-                </span>
+                <span class="inline-flex items-center gap-1.5"><span class="size-2 rounded-full bg-rose-500"></span>Mismatch</span>
+                <span class="inline-flex items-center gap-1.5"><span class="size-2 rounded-full bg-amber-500"></span>Review Zone</span>
+                <span class="inline-flex items-center gap-1.5"><span class="size-2 rounded-full bg-emerald-600"></span>Match</span>
               </div>
             </div>
 
@@ -527,7 +654,7 @@ export function App() {
               <div class="h-full w-[35%] bg-emerald-100"></div>
               <div
                 class="absolute bottom-0 top-0 w-1 -translate-x-1/2 bg-slate-900 shadow-sm transition-all duration-300"
-                style={{ left: verificationScore() ? scorePercent() : '0%' }}
+                style={{ left: result() ? scorePercent() : '0%' }}
               >
                 <div class="absolute -left-[2px] -top-0.5 size-2 rounded-full bg-slate-900"></div>
               </div>
@@ -540,19 +667,387 @@ export function App() {
                   0.650
                 </span>
               </div>
-              <button
-                class="flex items-center justify-center gap-2 rounded-lg bg-slate-900 px-4 py-2 text-xs font-medium text-white shadow-sm transition-all hover:bg-slate-800 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-60"
-                type="button"
-                disabled={!isReady()}
-                onClick={verifyCandidate}
-              >
-                <span class="material-symbols-outlined text-[16px]">verified</span>
-                <span>Verify Candidate</span>
-              </button>
+              <Show when={probeMode() === 'static'}>
+                <button
+                  class="flex items-center justify-center gap-2 rounded-lg bg-slate-900 px-4 py-2 text-xs font-medium text-white shadow-sm transition-all hover:bg-slate-800 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-60"
+                  type="button"
+                  disabled={!isReady()}
+                  onClick={() => void verifyCandidate()}
+                >
+                  <span class="material-symbols-outlined text-[16px]">verified</span>
+                  <span>{isVerifying() ? 'Verifying' : 'Verify Candidate'}</span>
+                </button>
+              </Show>
             </div>
           </div>
         </section>
       </main>
+
+      <Show when={cropPreview()}>
+        {(preview) => (
+          <div
+            class="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/55 p-4 backdrop-blur-sm"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="crop-preview-title"
+            onClick={() => setCropPreview(undefined)}
+          >
+            <div
+              class="w-full max-w-md rounded-xl border border-slate-200 bg-white shadow-2xl"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div class="flex items-center justify-between gap-3 border-b border-slate-100 px-4 py-3">
+                <div class="min-w-0">
+                  <h2 id="crop-preview-title" class="truncate text-sm font-semibold text-slate-900">
+                    {preview().title}
+                  </h2>
+                  <p class="mt-0.5 truncate font-mono text-xs text-slate-500">{preview().detail}</p>
+                </div>
+                <button
+                  class="flex size-8 shrink-0 items-center justify-center rounded-md border border-slate-200 bg-white text-slate-500 shadow-sm transition-colors hover:bg-slate-50 hover:text-slate-900"
+                  type="button"
+                  title="Close preview"
+                  onClick={() => setCropPreview(undefined)}
+                >
+                  <span class="material-symbols-outlined text-[18px]">close</span>
+                </button>
+              </div>
+              <div class="bg-slate-100 p-5">
+                <div class="mx-auto aspect-square w-full max-w-72 overflow-hidden rounded-lg border border-slate-300 bg-white shadow-inner">
+                  <img class="size-full object-contain" src={preview().url} alt={preview().title} />
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </Show>
     </div>
   )
+}
+
+function ImagePanel(props: {
+  branch: 'reference' | 'probe'
+  title: string
+  subtitle: string
+  modeLabel: JSX.Element
+  imageUrl?: string
+  croppedUrl?: string
+  face?: FaceDetectionSummary
+  dimensions?: SourceDimensions
+  mirrored?: boolean
+  showVideo?: boolean
+  videoRef?: (element: HTMLVideoElement) => void
+  emptyTitle?: string
+  emptyDetail?: string
+  metadataTitle: string
+  metadataDetail: string
+  action: JSX.Element
+  onEmptyClick: () => void
+  onPreviewCrop?: (url: string) => void
+}) {
+  return (
+    <article class="flex flex-col gap-4 rounded-xl border border-slate-200 bg-white p-5 shadow-[0_1px_3px_rgba(15,23,42,0.04),0_1px_2px_rgba(15,23,42,0.04)]">
+      <div class="flex items-center justify-between gap-3 border-b border-slate-100 pb-1">
+        <div class="flex min-w-0 items-center gap-2">
+          <span class="flex size-5 shrink-0 items-center justify-center rounded border border-slate-200 bg-slate-100 font-mono text-xs font-semibold text-slate-700">
+            {props.branch === 'reference' ? '1' : '2'}
+          </span>
+          <h2 class="text-sm font-semibold tracking-tight text-slate-900">{props.title}</h2>
+          <span class="hidden text-xs font-normal text-slate-500 sm:inline">{props.subtitle}</span>
+        </div>
+        {props.modeLabel}
+      </div>
+
+      <div class="relative flex aspect-[4/3] w-full items-center justify-center overflow-hidden rounded-lg border border-slate-200 bg-slate-50">
+        <Show when={props.imageUrl}>
+          <img class="size-full object-cover" src={props.imageUrl} alt={`${props.title} source`} />
+        </Show>
+        <Show when={props.showVideo}>
+          <>
+            <video
+              ref={(element) => props.videoRef?.(element)}
+              class="size-full scale-x-[-1] object-cover"
+              autoplay
+              muted
+              playsinline
+            />
+            <div class="pointer-events-none absolute bottom-3 left-3">
+              <span class="inline-flex items-center gap-1.5 rounded border border-slate-200 bg-white/90 px-2 py-0.5 font-mono text-[11px] text-slate-600 shadow-sm backdrop-blur">
+                <span class="size-1.5 rounded-full bg-emerald-500"></span>
+                30.0 FPS
+              </span>
+            </div>
+          </>
+        </Show>
+        <Show when={props.face && props.dimensions}>
+          <FaceOverlay face={props.face} dimensions={props.dimensions} mirrored={props.mirrored} />
+        </Show>
+        <Show when={!props.imageUrl && !props.showVideo}>
+          <button
+            class="absolute inset-0 flex cursor-pointer flex-col items-center justify-center bg-white/95 p-6 text-center transition-colors hover:bg-slate-50"
+            type="button"
+            onClick={props.onEmptyClick}
+          >
+            <div class="mb-2 flex size-10 items-center justify-center rounded-full border border-slate-100 bg-slate-100 text-slate-500">
+              <span class="material-symbols-outlined text-xl">
+                {props.branch === 'reference' ? 'image' : 'face_retouching_off'}
+              </span>
+            </div>
+            <h3 class="text-sm font-semibold text-slate-900">
+              {props.emptyTitle ?? 'No Reference Enrolled'}
+            </h3>
+            <p class="mt-1 max-w-xs text-xs text-slate-500">
+              {props.emptyDetail ?? 'Upload a biometric image to create the reference enrollment.'}
+            </p>
+          </button>
+        </Show>
+      </div>
+
+      <div class="flex items-center justify-between gap-4 rounded-lg border border-slate-200 bg-slate-50 p-3">
+        <div class="flex min-w-0 items-center gap-3">
+          <button
+            class="group relative flex size-11 shrink-0 items-center justify-center overflow-hidden rounded border border-slate-300 bg-white shadow-sm transition-colors disabled:cursor-default"
+            type="button"
+            disabled={!props.croppedUrl}
+            title={props.croppedUrl ? 'Preview crop' : undefined}
+            onClick={() => {
+              if (props.croppedUrl) props.onPreviewCrop?.(props.croppedUrl)
+            }}
+          >
+            <Show
+              when={props.croppedUrl}
+              fallback={<span class="material-symbols-outlined text-[18px] text-slate-300">center_focus_strong</span>}
+            >
+              <img class="size-full object-cover" src={props.croppedUrl} alt={`${props.title} cropped face`} />
+              <span class="absolute inset-0 flex items-center justify-center bg-slate-950/0 text-white opacity-0 transition-all group-hover:bg-slate-950/35 group-hover:opacity-100">
+                <span class="material-symbols-outlined text-[16px]">zoom_in</span>
+              </span>
+            </Show>
+          </button>
+          <div class="min-w-0">
+            <p class="truncate text-xs font-semibold text-slate-800">{props.metadataTitle}</p>
+            <p class="mt-0.5 truncate font-mono text-xs text-slate-500">{props.metadataDetail}</p>
+          </div>
+        </div>
+        {props.action}
+      </div>
+    </article>
+  )
+}
+
+function FaceOverlay(props: {
+  face?: FaceDetectionSummary
+  dimensions?: SourceDimensions
+  mirrored?: boolean
+}) {
+  const boxStyle = createMemo(() => {
+    const face = props.face
+    const dimensions = props.dimensions
+
+    if (!face || !dimensions) return {}
+
+    const left = props.mirrored
+      ? 100 - ((face.box.x + face.box.width) / dimensions.width) * 100
+      : (face.box.x / dimensions.width) * 100
+
+    return {
+      left: `${left}%`,
+      top: `${(face.box.y / dimensions.height) * 100}%`,
+      width: `${(face.box.width / dimensions.width) * 100}%`,
+      height: `${(face.box.height / dimensions.height) * 100}%`,
+    }
+  })
+
+  return (
+    <>
+      <div class="pointer-events-none absolute rounded-md border border-slate-900/70 bg-slate-900/5 shadow-sm" style={boxStyle()}>
+        <span class="absolute -top-2.5 left-2 rounded bg-slate-900 px-1.5 py-0.5 font-mono text-[10px] text-white shadow-sm">
+          {props.face ? `${Math.round(props.face.confidence * 100)}%` : ''}
+        </span>
+      </div>
+      <For each={props.face?.keypoints ?? []}>
+        {(keypoint) => (
+          <span
+            class="pointer-events-none absolute size-1.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-slate-950 shadow-[0_0_0_2px_rgba(255,255,255,0.85)]"
+            style={{
+              left: `${props.mirrored ? (1 - keypoint.x) * 100 : keypoint.x * 100}%`,
+              top: `${keypoint.y * 100}%`,
+            }}
+            title={keypoint.label}
+          />
+        )}
+      </For>
+      <div class="pointer-events-none absolute left-3 top-3">
+        <span class="inline-flex items-center gap-1.5 rounded-md border border-slate-200 bg-white/95 px-2.5 py-1 text-xs font-medium text-slate-800 shadow-sm backdrop-blur">
+          <span class="size-2 rounded-full bg-emerald-500"></span>
+          1 face detected
+        </span>
+      </div>
+    </>
+  )
+}
+
+function PipelineTimeline(props: {
+  referenceRows: PipelineRow[]
+  probeRows: PipelineRow[]
+  referenceTotalMs: number
+  probeTotalMs: number
+  canRunContinuous: boolean
+  isContinuousRunning: boolean
+  onStartContinuous: () => void
+  onStopContinuous: () => void
+}) {
+  return (
+    <section class="rounded-xl border border-slate-200 bg-white p-4 shadow-[0_1px_3px_rgba(15,23,42,0.04),0_1px_2px_rgba(15,23,42,0.04)] sm:p-5">
+      <div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-2">
+        <div class="flex items-center gap-2">
+          <span class="material-symbols-outlined text-[18px] text-slate-500">alt_route</span>
+          <h3 class="text-xs font-semibold tracking-tight text-slate-900 sm:text-sm">
+            Execution Trace & Inference Pipelines
+          </h3>
+          <span class="hidden text-[11px] text-slate-400 sm:inline">
+            Per-frame SIMD worker latency
+          </span>
+        </div>
+        <div class="flex items-center gap-2">
+          <button
+            class="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs font-medium shadow-sm transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+            classList={{
+              'border-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100': props.isContinuousRunning,
+              'border-slate-200 bg-white text-slate-700 hover:bg-slate-50': !props.isContinuousRunning,
+            }}
+            type="button"
+            disabled={!props.canRunContinuous && !props.isContinuousRunning}
+            onClick={() => {
+              if (props.isContinuousRunning) {
+                props.onStopContinuous()
+                return
+              }
+
+              props.onStartContinuous()
+            }}
+          >
+            <span class="material-symbols-outlined text-[15px]">
+              {props.isContinuousRunning ? 'stop_circle' : 'play_circle'}
+            </span>
+            <span>{props.isContinuousRunning ? 'Stop Continuous' : 'Run Continuous'}</span>
+          </button>
+          <span class="rounded border border-slate-200 bg-slate-50 px-2 py-0.5 font-mono text-[11px] text-slate-500">
+            WASM SIMD Parallel
+          </span>
+        </div>
+      </div>
+
+      <div class="flex flex-col gap-3 pt-3">
+        <PipelineBranch
+          label="Reference Stream"
+          rows={props.referenceRows}
+          totalMs={props.referenceTotalMs}
+          emptyStages={['Image Ingest', 'Detection', 'Align & Crop', '512-d Vector']}
+        />
+        <PipelineBranch
+          label="Live Candidate Stream"
+          rows={props.probeRows}
+          totalMs={props.probeTotalMs}
+          emptyStages={['Frame Ingest', 'Detection', 'Align & Crop', '512-d Vector', 'Cosine Compare']}
+        />
+      </div>
+    </section>
+  )
+}
+
+function PipelineBranch(props: {
+  label: string
+  rows: PipelineRow[]
+  totalMs: number
+  emptyStages: string[]
+}) {
+  const tiles = createMemo(() => compactPipelineRows(props.rows, props.emptyStages))
+
+  return (
+    <div class="flex flex-col gap-1.5">
+      <div class="flex items-center justify-between text-[11px] font-medium text-slate-500">
+        <span class="flex items-center gap-1.5">
+          <span class="size-1.5 rounded-full bg-slate-400"></span>
+          {props.label}
+        </span>
+        <span class="font-mono text-[11px] text-slate-400">
+          Cumulative: {props.totalMs.toFixed(1)} ms
+        </span>
+      </div>
+      <div class="grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-5">
+        <For each={tiles()}>
+          {(tile) => (
+            <div
+              class="flex items-center justify-between gap-2 rounded-lg border bg-slate-50 px-2.5 py-2"
+              classList={{
+                'border-slate-200': tile.status === 'idle',
+                'border-emerald-200': tile.status === 'success',
+                'border-amber-200': tile.status === 'running' || tile.status === 'warning',
+                'border-rose-200': tile.status === 'error',
+              }}
+            >
+              <div class="flex min-w-0 items-center gap-1.5">
+                <span
+                  class="material-symbols-outlined shrink-0 text-[15px]"
+                  classList={{
+                    'text-slate-400': tile.status === 'idle',
+                    'text-emerald-600': tile.status === 'success',
+                    'text-amber-600': tile.status === 'running' || tile.status === 'warning',
+                    'text-rose-600': tile.status === 'error',
+                  }}
+                >
+                  {tile.status === 'error'
+                    ? 'error'
+                    : tile.status === 'running'
+                      ? 'progress_activity'
+                      : tile.status === 'idle'
+                        ? 'radio_button_unchecked'
+                        : 'check_circle'}
+                </span>
+                <span class="truncate text-xs font-medium text-slate-700">{tile.label}</span>
+              </div>
+              <span class="shrink-0 font-mono text-[11px] text-slate-500">
+                {tile.durationMs === undefined ? '--' : `${tile.durationMs.toFixed(1)} ms`}
+              </span>
+            </div>
+          )}
+        </For>
+      </div>
+    </div>
+  )
+}
+
+function compactPipelineRows(rows: PipelineRow[], emptyStages: string[]) {
+  if (!rows.length) {
+    return emptyStages.map((label) => ({
+      label,
+      status: 'idle' as const,
+      durationMs: undefined,
+    }))
+  }
+
+  const labels = emptyStages.map((label) => ({
+    label,
+    status: 'idle' as PipelineRow['status'],
+    durationMs: undefined as number | undefined,
+  }))
+
+  for (const row of rows) {
+    const label = row.stage === 'source-ready' && row.branch === 'probe' ? 'Frame Ingest' : STAGE_LABELS[row.stage]
+    const target = labels.find((tile) => tile.label === label)
+
+    if (!target) continue
+
+    target.status = row.status
+    if (row.durationMs !== undefined) {
+      target.durationMs = row.durationMs
+    }
+  }
+
+  return labels
+}
+
+function totalDuration(rows: PipelineRow[]): number {
+  return rows.reduce((total, row) => total + (row.durationMs ?? 0), 0)
 }
